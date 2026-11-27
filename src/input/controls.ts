@@ -18,6 +18,8 @@ interface InputCallbacks {
   onChatOpen?: () => void;
   onChatClose?: () => void;
   onQuickChat?: (slot: number) => void;
+  isSpectator?: () => boolean;
+  onSpectatorCycleCam?: () => void;
   getViewportSize: () => [number, number];
   getHandedness: () => "right" | "left";
 }
@@ -190,7 +192,7 @@ export class InputController {
         return;
       }
       if (this.cb.onSkipReplay()) return;
-      if (this.cb.isOverlayOpen()) return;
+      if (this.cb.isOverlayOpen() || this.cb.isSpectator?.()) return;
 
       if (e.pointerType === "mouse") {
         this.pointerDownT = performance.now();
@@ -206,7 +208,7 @@ export class InputController {
 
     this.canvas.addEventListener("pointermove", (e) => {
       if (e.pointerType === "touch") this.touchy = true;
-      if (this.cb.isOverlayOpen()) return;
+      if (this.cb.isOverlayOpen() || this.cb.isSpectator?.()) return;
 
       // For mouse: ONLY allow no-button hover-flick if the user opted in via Settings!
       // For touch: always track swipe gestures!
@@ -247,7 +249,7 @@ export class InputController {
       if (e.pointerType !== "mouse" || !this.pointerDownT) return;
       const held = performance.now() - this.pointerDownT;
       this.pointerDownT = 0;
-      if (this.cb.isOverlayOpen()) return;
+      if (this.cb.isOverlayOpen() || this.cb.isSpectator?.()) return;
       const pwr = held < 130 ? 0.68 : clamp((held - 70) / 310, 0.50, 1.0);
       const dragUp = this.pointerStartY - e.clientY > 34;
       const dragDown = e.clientY - this.pointerStartY > 38;
@@ -302,12 +304,17 @@ export class InputController {
         this.cb.onPauseToggle();
         return;
       }
+      if (e.code === "Tab" && !this.cb.isOverlayOpen() && this.cb.isSpectator?.()) {
+        e.preventDefault();
+        this.cb.onSpectatorCycleCam?.();
+        return;
+      }
       if (e.code === "Enter" && this.cb.isOverlayOpen()) {
         e.preventDefault();
         this.cb.onOverlayConfirm();
         return;
       }
-      if (this.cb.isOverlayOpen() || e.repeat) return;
+      if (this.cb.isOverlayOpen() || e.repeat || this.cb.isSpectator?.()) return;
 
       if (e.code === "Space") {
         e.preventDefault();

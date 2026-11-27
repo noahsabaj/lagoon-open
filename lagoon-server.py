@@ -18,6 +18,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import socket
 import struct
 import sys
@@ -29,6 +30,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_FRAME = 4 * 1024 * 1024
+MAX_ROOM_PEERS = 10  # Up to 4 players + 6 spectators
+SIGNAL_PATH_RE = re.compile(r"^/signal/([A-Za-z0-9]{4})/?$")
 
 MIME_EXTRA = {
     ".html": "text/html; charset=utf-8",
@@ -48,6 +51,9 @@ MIME_EXTRA = {
 
 clients = []
 clients_lock = threading.Lock()
+next_cid = 1
+signal_rooms = {}  # code -> {"next_seq": int, "peers": {peer_id: (Client, is_host)}}
+signal_lock = threading.Lock()
 print_lock = threading.Lock()
 
 
@@ -90,9 +96,10 @@ def lan_ips():
 
 
 class Client:
-    def __init__(self, sock, addr):
+    def __init__(self, sock, addr, cid=""):
         self.sock = sock
         self.addr = addr
+        self.cid = cid
         self.alive = True
         self._cond = threading.Condition()
         self._reliable = collections.deque()
@@ -196,32 +203,52 @@ def count():
         return len(clients)
 
 
-def sys_msg():
-    return json.dumps({"t": "sys", "count": count(), "ips": lan_ips()}).encode("utf-8")
+def sys_msg(self_id=None):
+    with clients_lock:
+        ids = [c.cid for c in clients]
+    msg = {"t": "sys", "count": len(ids), "peers": ids, "ips": lan_ips()}
+    if self_id:
+        msg["id"] = self_id
+    return json.dumps(msg).encode("utf-8")
 
 
-def broadcast(data):
+def broadcast_sys():
     with clients_lock:
         snap = list(clients)
     for c in snap:
-        c.send(1, data)
+        c.send(1, sys_msg(c.cid))
 
 
 def is_coalescable_snapshot(opcode, data):
     # Pure periodic state snapshot without embedded events/phase-critical flags
-    return opcode == 1 and data.startswith(b'{"t":"s",') and b'"ev":[' not in data
+    return opcode == 1 and b'"t":"s"' in data[:48] and b'"ev":[' not in data
 
 
 def relay(sender, opcode, data):
     coalescable = is_coalescable_snapshot(opcode, data)
+    target_id = None
+    out_data = data
+    if opcode == 1:
+        try:
+            obj = json.loads(data.decode("utf-8"))
+            if isinstance(obj, dict):
+                target_id = obj.get("to")
+                obj["from"] = sender.cid
+                out_data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            pass
+
     with clients_lock:
         snap = list(clients)
     for c in snap:
-        if c is not sender:
-            c.send(opcode, data, coalescable=coalescable)
+        if c is sender:
+            continue
+        if target_id and c.cid != target_id:
+            continue
+        c.send(opcode, out_data, coalescable=coalescable)
 
 
-def ws_loop(client, reader):
+def read_ws_messages(client, reader, on_message):
     frag = bytearray()
     frag_op = 1
     while client.alive:
@@ -253,8 +280,127 @@ def ws_loop(client, reader):
             frag_op = op
         frag += data
         if fin:
-            relay(client, frag_op, bytes(frag))
+            on_message(frag_op, bytes(frag))
             frag = bytearray()
+
+
+def ws_loop(client, reader):
+    read_ws_messages(client, reader, lambda op, payload: relay(client, op, payload))
+
+
+def signal_send(client, obj):
+    client.send(1, json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+
+def handle_signal_ws(sock, addr, reader, hdrs, code, want_host):
+    code = code.upper()
+    with signal_lock:
+        room = signal_rooms.get(code)
+        if room is None:
+            if not want_host:
+                sock.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\nConnection: close\r\n\r\nRoom not found")
+                return
+            room = {"next_seq": 1, "peers": {}}
+            signal_rooms[code] = room
+        has_host = any(is_h for _, is_h in room["peers"].values())
+        if want_host and has_host:
+            sock.sendall(b"HTTP/1.1 409 Conflict\r\nContent-Length: 23\r\nConnection: close\r\n\r\nRoom already has a host")
+            return
+        if not want_host and not has_host:
+            sock.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\nConnection: close\r\n\r\nRoom not found")
+            return
+        if len(room["peers"]) >= MAX_ROOM_PEERS:
+            sock.sendall(b"HTTP/1.1 409 Conflict\r\nContent-Length: 12\r\nConnection: close\r\n\r\nRoom is full")
+            return
+        peer_id = "host" if want_host else f"p{room['next_seq']}"
+        if not want_host:
+            room["next_seq"] += 1
+
+    accept = base64.b64encode(
+        hashlib.sha1(hdrs["sec-websocket-key"].encode("ascii") + WS_GUID).digest()
+    ).decode("ascii")
+    sock.sendall(
+        (
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).encode("ascii")
+    )
+    client = Client(sock, addr, cid=peer_id)
+    host_client = None
+    peer_count = 0
+    with signal_lock:
+        room = signal_rooms.get(code)
+        if room is None:
+            client.close()
+            return
+        room["peers"][peer_id] = (client, want_host)
+        peer_count = len(room["peers"])
+        for pid, (c, is_h) in room["peers"].items():
+            if is_h:
+                host_client = (pid, c)
+                break
+
+    log(f"[signal:{code}] + {peer_id} ({peer_count} in room)")
+    signal_send(client, {
+        "t": "welcome",
+        "id": peer_id,
+        "isHost": want_host,
+        "hostId": host_client[0] if host_client else peer_id,
+        "count": peer_count,
+    })
+    if not want_host and host_client:
+        signal_send(host_client[1], {"t": "peer-joined", "peerId": peer_id, "count": peer_count})
+
+    def on_sig_msg(op, payload):
+        if op != 1:
+            return
+        try:
+            msg = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(msg, dict):
+            return
+        kind = msg.get("t")
+        if kind in ("offer", "answer", "ice"):
+            to_id = str(msg.get("to") or "")
+            with signal_lock:
+                r = signal_rooms.get(code)
+                target = r["peers"].get(to_id)[0] if (r and to_id in r["peers"]) else None
+            if target:
+                msg["from"] = peer_id
+                signal_send(target, msg)
+        elif kind == "ping":
+            signal_send(client, {"t": "pong", "ts": msg.get("ts")})
+
+    try:
+        read_ws_messages(client, reader, on_sig_msg)
+    finally:
+        client.close()
+        to_close = []
+        notify_host = None
+        remaining = 0
+        with signal_lock:
+            room = signal_rooms.get(code)
+            if room and peer_id in room["peers"]:
+                del room["peers"][peer_id]
+                remaining = len(room["peers"])
+                if want_host:
+                    to_close = [c for c, _ in room["peers"].values()]
+                    room["peers"].clear()
+                    del signal_rooms[code]
+                else:
+                    for _, (c, is_h) in room["peers"].items():
+                        if is_h:
+                            notify_host = c
+                            break
+                    if not room["peers"]:
+                        del signal_rooms[code]
+        for other in to_close:
+            signal_send(other, {"t": "host-left"})
+            other.close()
+        if notify_host:
+            signal_send(notify_host, {"t": "peer-left", "peerId": peer_id, "count": remaining})
+        log(f"[signal:{code}] - {peer_id} ({remaining} left)")
 
 
 def resolve_dist_file(url_path):
@@ -274,6 +420,7 @@ def resolve_dist_file(url_path):
 
 def serve_http(sock, path):
     fp = resolve_dist_file(path)
+    ext = ""
     if fp:
         with open(fp, "rb") as f:
             body = f.read()
@@ -316,6 +463,15 @@ def handle(sock, addr):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
             except OSError:
                 pass
+            parsed_url = urllib.parse.urlsplit(path)
+            sig_m = SIGNAL_PATH_RE.match(parsed_url.path)
+            if sig_m:
+                qs = urllib.parse.parse_qs(parsed_url.query)
+                want_host = (qs.get("role", [""])[0] == "host")
+                handle_signal_ws(sock, addr, reader, hdrs, sig_m.group(1), want_host)
+                return
+
+            global next_cid
             accept = base64.b64encode(
                 hashlib.sha1(hdrs["sec-websocket-key"].encode("ascii") + WS_GUID).digest()
             ).decode("ascii")
@@ -325,11 +481,13 @@ def handle(sock, addr):
                     f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
                 ).encode("ascii")
             )
-            client = Client(sock, addr)
             with clients_lock:
+                cid = f"c{next_cid}"
+                next_cid += 1
+                client = Client(sock, addr, cid=cid)
                 clients.append(client)
-            log(f"[+] Player connected from {addr[0]}  ({count()} online)")
-            broadcast(sys_msg())
+            log(f"[+] Player {cid} connected from {addr[0]}  ({count()} online)")
+            broadcast_sys()
             ws_loop(client, reader)
         else:
             serve_http(sock, path)
@@ -341,8 +499,8 @@ def handle(sock, addr):
             with clients_lock:
                 if client in clients:
                     clients.remove(client)
-            log(f"[-] Player disconnected  ({count()} online)")
-            broadcast(sys_msg())
+            log(f"[-] Player {client.cid} disconnected  ({count()} online)")
+            broadcast_sys()
         try:
             sock.close()
         except OSError:

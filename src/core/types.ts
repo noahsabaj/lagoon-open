@@ -406,9 +406,30 @@ export interface GameState {
   stats: MatchStats;
 }
 
+export type NetMode = "online" | "lan";
+export type PlayerSlot = 0 | 1 | 2 | 3;
+export type SeatKind = "human" | "bot" | "dual";
+export type SpectatorCamMode = "umpire" | "broadcast" | "courtside" | "follow" | "orbit";
+
+export interface RoomPeerInfo {
+  id: string;
+  name: string;
+  avatar: AvatarConfig;
+  slot: PlayerSlot | null; // null => spectator
+  isHost: boolean;
+  pingMs: number | null;
+}
+
+export interface SeatAssignment {
+  kind: SeatKind;
+  peerId: string | null;
+  botRivalId: string;
+}
+
 export interface NetLobbyConfig {
   discipline: MatchDiscipline;
   format: MatchFormat;
   venue: VenueId;
   sky: SkyId;
+  soloDoublesMode: "bot" | "dual";
 }

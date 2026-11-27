@@ -6,6 +6,7 @@ import {
   G,
   L,
   lerp,
+  makeSeededRng,
   NET,
   PRESETS,
   rand,
@@ -24,8 +25,10 @@ import type {
   GameMode,
   GameState,
   MatchConfig,
+  PlayerSlot,
   PlayerState,
   RGB,
+  SeatKind,
   SettingsState,
   ShotIntent,
   ShotTag,
@@ -70,13 +73,15 @@ interface EngineUiHooks {
   showEndlessResult: () => void;
   updateReplayBanner: (visible: boolean, label?: string) => void;
   updateHawkEyeBanner: (visible: boolean, isIn?: boolean, distCm?: number, lineLabel?: string) => void;
-  onNetEvent?: (e: { k: string; a: unknown[] }) => void;
-  isLanGuest?: () => boolean;
-  onLanGuestSwing?: (power: number, intent: ShotIntent) => void;
-  getLanPeerName?: () => string;
-  getLanPeerAvatar?: () => AvatarConfig;
-  getLanRole?: () => "host" | "guest" | null;
-  setLanAimNext?: (who: "host" | "guest") => void;
+  onNetEvent?: (e: { k: string; a: unknown[]; slot?: PlayerSlot; seq?: number }) => void;
+  isNetRemoteClient?: () => boolean;
+  isNetSpectator?: () => boolean;
+  onNetGuestSwing?: (power: number, intent: ShotIntent) => void;
+  getNetTeamNames?: () => [string, string];
+  getNetSlotAvatars?: () => AvatarConfig[];
+  getNetSeatKinds?: () => [SeatKind, SeatKind, SeatKind, SeatKind];
+  getNetBotRivalId?: (slot: PlayerSlot) => string;
+  setNetAimNext?: (who: "team0" | "team1") => void;
 }
 
 export function mkPlayer(slot: number, team: 0 | 1, role: "baseline" | "net", x: number, z: number, speed: number): PlayerState {
@@ -135,13 +140,17 @@ export class GameEngine {
   public endless: EndlessState | null = null;
   public replay = new ReplaySystem();
 
-  public netCtx: "local" | "guest" = "local";
+  public netCtx: "local" | "remote" = "local";
+  public netActorSlot: PlayerSlot = 0;
+  public netActorSeq: number | undefined = undefined;
+  public netPredictMode = false;
   public lastMph = 0;
   public trophyCeremony = false;
   private pendingReplayLabel: string | null = null;
   private lastPointSnapshot = { isBig: false, label: "" };
   private _slotAvatars: AvatarConfig[] = [];
   private _visibleSlots: boolean[] = [true, true, false, false];
+  private _rng: (a: number, b: number) => number = rand;
 
   constructor(
     public career: CareerState,
@@ -222,27 +231,53 @@ export class GameEngine {
     return PRESETS[rival?.sky || this.getActiveVenue().defaultSky] || PRESETS.golden;
   }
 
-  public getOppName(): string {
-    if (this.game.mode === "net") return this.ui.getLanPeerName?.() || "Buddy";
+  public getTeamNames(): [string, string] {
+    if (this.game.mode === "net" && this.ui.getNetTeamNames) {
+      return this.ui.getNetTeamNames();
+    }
     const o = CAST[this.game.config.oppId] || CAST.reef;
     if (this.game.config.discipline === "doubles") {
       const op = CAST[this.game.config.oppPartnerId] || getPartnerRival(o.id);
-      return `${o.name} & ${op.name}`;
+      return ["You + Partner", `${o.name} & ${op.name}`];
     }
-    return o.name;
+    return ["You", o.name];
+  }
+
+  public getOppName(): string {
+    return this.getTeamNames()[1];
   }
 
   public getSlotAvatars(): AvatarConfig[] {
+    if (this.game.mode === "net" && this.ui.getNetSlotAvatars) {
+      const avs = this.ui.getNetSlotAvatars();
+      for (let i = 0; i < 4; i++) this._slotAvatars[i] = avs[i] || BUDDY_AVATAR;
+      this._slotAvatars.length = 4;
+      return this._slotAvatars;
+    }
     const opp = CAST[this.game.config.oppId] || CAST.reef;
     const oppP = CAST[this.game.config.oppPartnerId] || getPartnerRival(opp.id);
     const youP = CAST[this.game.config.partnerId] || CAST.sunny;
 
     this._slotAvatars[0] = this.career.avatar;
-    this._slotAvatars[1] = this.game.mode === "net" ? (this.ui.getLanPeerAvatar?.() || BUDDY_AVATAR) : opp.avatar;
+    this._slotAvatars[1] = opp.avatar;
     this._slotAvatars[2] = youP.avatar;
     this._slotAvatars[3] = oppP.avatar;
     this._slotAvatars.length = 4;
     return this._slotAvatars;
+  }
+
+  public isNetBotSlot(slot: PlayerSlot): boolean {
+    if (this.game.mode !== "net") return false;
+    const kinds = this.ui.getNetSeatKinds?.();
+    return !!kinds && kinds[slot] === "bot";
+  }
+
+  public isTeamDualControl(team: 0 | 1): boolean {
+    if (this.game.config.discipline !== "doubles" || this.game.mode === "training") return false;
+    if (this.game.mode !== "net") return !this.settings.aiPartner && team === 0;
+    const kinds = this.ui.getNetSeatKinds?.();
+    if (!kinds) return true;
+    return team === 0 ? kinds[2] === "dual" : kinds[3] === "dual";
   }
 
   public getVisibleSlots(): boolean[] {
@@ -428,11 +463,27 @@ export class GameEngine {
     this.replay.clearBuffer();
     this.pendingReplayLabel = null;
 
-    this.you.handedness = this.career.avatar.handedness;
-    this.cpu.handedness = isNet ? (this.ui.getLanPeerAvatar?.()?.handedness || "right") : o.avatar.handedness;
-    this.cpu.speed = isNet ? this.you.speed : o.speed * Math.min(1.25, paceMult);
-    this.cpuPartner.speed = isNet ? this.you.speed : op.speed * Math.min(1.22, paceMult);
-    this.partner.speed = 5.65;
+    const avatars = this.getSlotAvatars();
+    this.you.handedness = avatars[0].handedness;
+    this.cpu.handedness = avatars[1].handedness;
+    this.partner.handedness = avatars[2].handedness;
+    this.cpuPartner.handedness = avatars[3].handedness;
+
+    const seatKinds = isNet ? this.ui.getNetSeatKinds?.() : undefined;
+    const botSpeed = (slot: PlayerSlot, fallback: number) => {
+      const rid = this.ui.getNetBotRivalId?.(slot);
+      return rid && CAST[rid] ? CAST[rid].speed : fallback;
+    };
+    this.you.speed = 5.9;
+    this.cpu.speed = isNet
+      ? seatKinds?.[1] === "bot" ? botSpeed(1, 4.35) : this.you.speed
+      : o.speed * Math.min(1.25, paceMult);
+    this.partner.speed = isNet
+      ? seatKinds?.[2] === "bot" ? botSpeed(2, 4.45) : this.you.speed
+      : 5.65;
+    this.cpuPartner.speed = isNet
+      ? seatKinds?.[3] === "bot" ? botSpeed(3, 4.35) : this.you.speed
+      : op.speed * Math.min(1.22, paceMult);
 
     for (const p of this.players) {
       p.pending = null;
@@ -443,25 +494,43 @@ export class GameEngine {
       p.telegraphShot = null;
     }
 
+    // In 4-player Doubles, rotate baseline/net roles so the active serverSlot serves from the baseline!
+    const srvSlot = (isDbl ? this.game.serverSlot : this.game.server) as PlayerSlot;
+    const nearBase = isDbl && srvSlot === 2 ? this.partner : this.you;
+    const nearNet = nearBase === this.you ? this.partner : this.you;
+    const farBase = isDbl && srvSlot === 3 ? this.cpuPartner : this.cpu;
+    const farNet = farBase === this.cpu ? this.cpuPartner : this.cpu;
+    nearBase.role = "baseline";
+    nearNet.role = "net";
+    farBase.role = "baseline";
+    farNet.role = "net";
+
     const sSign = d ? 1 : -1;
+    const serverIsBot = isNet ? this.isNetBotSlot(srvSlot) : this.game.server === 1;
     if (this.game.server === 0) {
-      this.placePlayer(this.you, sSign * 0.75, -0.4);
-      this.placePlayer(this.cpu, -sSign * 2.3, L + 0.8);
-      this.game.phase = "serveReady";
-    } else {
-      this.placePlayer(this.cpu, -sSign * 0.75, L + 0.4);
-      this.placePlayer(this.you, sSign * 2.2, -0.85);
-      if (isNet) {
-        this.game.phase = "serveReady";
+      this.placePlayer(nearBase, sSign * 0.75, -0.4);
+      this.placePlayer(farBase, -sSign * 2.3, L + 0.8);
+      if (serverIsBot) {
+        this.game.phase = "cpuServe";
+        this.game.timer = 1.25;
+        this.game.tossed = false;
       } else {
+        this.game.phase = "serveReady";
+      }
+    } else {
+      this.placePlayer(farBase, -sSign * 0.75, L + 0.4);
+      this.placePlayer(nearBase, sSign * 2.2, -0.85);
+      if (serverIsBot) {
         this.game.phase = "cpuServe";
         this.game.timer = 1.3;
         this.game.tossed = false;
+      } else {
+        this.game.phase = "serveReady";
       }
     }
     if (isDbl) {
-      this.placePlayer(this.partner, -sSign * 2.4, NET - 3.6);
-      this.placePlayer(this.cpuPartner, sSign * 2.4, NET + 3.6);
+      this.placePlayer(nearNet, -sSign * 2.4, NET - 3.6);
+      this.placePlayer(farNet, sSign * 2.4, NET + 3.6);
     }
 
     this.ui.updateHud();
@@ -483,14 +552,17 @@ export class GameEngine {
   }
 
   private triggerImpactJuice(isCrit: boolean, isRocket: boolean, col: RGB): void {
-    if (this.netCtx === "guest") this.ui.onNetEvent?.({ k: "juice", a: [isCrit, isRocket] });
-    else this.applyJuiceCam(isCrit, isRocket);
+    if (this.netCtx === "remote") {
+      this.ui.onNetEvent?.({ k: "juice", a: [isCrit, isRocket], slot: this.netActorSlot, seq: this.netActorSeq });
+    } else {
+      this.applyJuiceCam(isCrit, isRocket);
+    }
 
     if (isRocket) {
-      this.game.hitstop = 0.055;
+      if (!this.netPredictMode) this.game.hitstop = 0.055;
       this.renderer.vfx.burstSparks(this.ball.x, this.ball.y, this.ball.z, [1.0, 0.94, 0.55], 38, 7.5, 0.11, 3.8);
     } else if (isCrit) {
-      this.game.hitstop = 0.038;
+      if (!this.netPredictMode) this.game.hitstop = 0.038;
       this.renderer.vfx.burstSparks(this.ball.x, this.ball.y, this.ball.z, col, 26, 6.0, 0.09, 3.2);
     } else {
       this.renderer.vfx.burstSparks(this.ball.x, this.ball.y, this.ball.z, col, 12, 3.8, 0.07, 2.2);
@@ -499,210 +571,258 @@ export class GameEngine {
 
   public humanSwing(power: number, intent: ShotIntent = "drive"): void {
     this.sfx.init();
-    if (this.ui.isLanGuest?.() && this.game.mode === "net") {
-      this.ui.onLanGuestSwing?.(power, intent);
+    if (this.ui.isNetSpectator?.() && this.game.mode === "net") return;
+    if (this.ui.isNetRemoteClient?.() && this.game.mode === "net") {
+      this.ui.onNetGuestSwing?.(power, intent);
       return;
     }
-    if (this.replay.active || this.replay.hawkeye.active) {
-      this.skipBroadcastOverlay();
-      return;
+    this.executeNearSlotSwing(0, power, intent, { allowDualControl: this.isTeamDualControl(0) });
+  }
+
+  /**
+   * Executes a near-side (Team 0 in current world orientation) swing or serve for
+   * `localSlot` (0 or 2). Used directly by Host (slots 0 & 2), by Host in mirrored
+   * orientation for Team 1 (slots 1 & 3), and by Guests for 0ms local swing prediction!
+   */
+  public executeNearSlotSwing(
+    localSlot: 0 | 2,
+    power: number,
+    intent: ShotIntent = "drive",
+    opts?: { seed?: number; allowDualControl?: boolean; predictOnly?: boolean }
+  ): { connected: boolean; isServe: boolean; isToss: boolean } {
+    if (!opts?.predictOnly) {
+      if (this.replay.active || this.replay.hawkeye.active) {
+        this.skipBroadcastOverlay();
+        return { connected: false, isServe: false, isToss: false };
+      }
+      if (this.game.paused) return { connected: false, isServe: false, isToss: false };
     }
-    if (this.game.paused || this.game.now - this.game.lastSwing < 0.25) return;
-    const ph = this.game.phase;
-    if (ph === "title" || ph === "matchOver" || ph === "trainOver" || ph === "customizer") return;
-    if ((ph === "serveReady" || ph === "toss") && this.game.server !== 0) return;
 
-    this.game.lastSwing = this.game.now;
+    const prevRng = this._rng;
+    const prevPredict = this.netPredictMode;
+    this._rng = opts?.seed !== undefined ? makeSeededRng(opts.seed) : rand;
+    this.netPredictMode = !!opts?.predictOnly;
 
-    if (ph === "serveReady") {
-      const handSign = this.you.handedness === "left" ? -1 : 1;
-      Object.assign(this.ball, {
-        x: this.you.x + 0.20 * handSign,
-        y: 1.55,
-        z: this.you.z + 0.35,
-        vx: 0, vy: TOSS_VY, vz: 0,
-        w: { x: 0, y: 0, z: 0 },
-        visible: true, live: false, netted: false, rocket: false, crit: false, splashed: false,
+    try {
+      const ph = this.game.phase;
+      if (ph === "title" || ph === "matchOver" || ph === "trainOver" || ph === "customizer") {
+        return { connected: false, isServe: false, isToss: false };
+      }
+      if (!opts?.predictOnly && this.game.now - this.game.lastSwing < 0.25) {
+        return { connected: false, isServe: false, isToss: false };
+      }
+
+      const isDbl = this.game.config.discipline === "doubles" && this.game.mode !== "training";
+      const dual = opts?.allowDualControl ?? this.isTeamDualControl(0);
+
+      if (ph === "serveReady" || ph === "toss") {
+        if (this.game.server !== 0) return { connected: false, isServe: false, isToss: false };
+        const expectedSrv = (isDbl ? this.game.serverSlot : 0) as 0 | 2;
+        if (isDbl && !dual && expectedSrv !== localSlot) {
+          return { connected: false, isServe: false, isToss: false };
+        }
+        const serverP = this.players[expectedSrv] || this.you;
+        this.game.lastSwing = this.game.now;
+
+        if (ph === "serveReady") {
+          const handSign = serverP.handedness === "left" ? -1 : 1;
+          Object.assign(this.ball, {
+            x: serverP.x + 0.20 * handSign,
+            y: 1.55,
+            z: serverP.z + 0.35,
+            vx: 0, vy: TOSS_VY, vz: 0,
+            w: { x: 0, y: 0, z: 0 },
+            visible: true, live: false, netted: false, rocket: false, crit: false, splashed: false,
+          });
+          serverP.tossArm = 1.0;
+          this.game.phase = "toss";
+          this.game.tossT = 0;
+          this.ui.setHint();
+          return { connected: true, isServe: false, isToss: true };
+        }
+
+        this.serveHit(serverP, power, intent);
+        return { connected: true, isServe: true, isToss: false };
+      }
+
+      if (ph !== "rally" && ph !== "training") return { connected: false, isServe: false, isToss: false };
+      this.game.lastSwing = this.game.now;
+
+      let hitter = this.players[localSlot] || this.you;
+      if (isDbl && dual) {
+        const d0 = Math.hypot(this.ball.x - this.you.x, this.ball.z - this.you.z);
+        const d2 = Math.hypot(this.ball.x - this.partner.x, this.ball.z - this.partner.z);
+        hitter = d2 < d0 - 0.15 ? this.partner : this.you;
+      }
+
+      const b = this.ball;
+      const useLob = intent === "lob" || (this.game.lobArmed && intent !== "slice" && intent !== "drop");
+      this.game.lobArmed = false;
+      this.ui.updateTelemetry();
+
+      if (!b.live || b.lastHitter !== 1 || (b.serve && b.bounceCount === 0 && b.z > NET)) {
+        hitter.swingT = hitter.swingDur = 0.32;
+        hitter.swingType = "fh";
+        this.ui.feedback("Swing", "wait for the ball");
+        return { connected: false, isServe: false, isToss: false };
+      }
+
+      const dz = b.z - hitter.z;
+      const dx = b.x - hitter.x;
+      const absDx = Math.abs(dx);
+      const isSmash = b.y >= 1.95 && b.z > NET - 4.8 && absDx < WIN.smash.diveX && dz <= WIN.smash.early && dz >= WIN.smash.late;
+      const isVolley = !isSmash && b.bounceCount === 0 && hitter.z > NET - SVC - 0.8 && dz <= WIN.volley.early && dz >= WIN.volley.late && b.y >= WIN.volley.yLo && b.y <= WIN.volley.yHi;
+      const shotKey: ShotTag = isSmash ? "smash" : isVolley ? "volley" : useLob ? "lob" : intent === "drop" ? "drop" : intent === "slice" ? "slice" : "drive";
+      const win = isSmash ? WIN.smash : isVolley ? WIN.volley : useLob ? WIN.lob : intent === "drop" ? WIN.drop : WIN.ground;
+      const volleyOk = b.bounceCount >= 1 || isVolley || isSmash || b.z > 4.2;
+
+      const isDive = absDx > win.x && absDx <= win.diveX && dz <= win.early + 0.25 && dz >= win.late - 0.25 && b.y <= win.yHi && volleyOk && b.z <= NET - 0.25;
+
+      if (!isDive && (b.z > NET - 0.25 || dz > win.early || dz < win.late || absDx > win.x || b.y > win.yHi || !volleyOk)) {
+        hitter.swingT = hitter.swingDur = 0.32;
+        hitter.swingType = dx <= 0 ? "fh" : "bh";
+        if (b.vz < 0 && dz > win.early && dz < 9.5) this.ui.feedback("Too early", "let it come to you");
+        else if (dz < win.late) this.ui.feedback("Too late", "swing sooner");
+        return { connected: false, isServe: false, isToss: false };
+      }
+
+      const hw = courtHalfWidth(this.game.config.discipline);
+      const span = dz >= win.sweet ? win.early - win.sweet : win.sweet - win.late;
+      const tau = clamp((dz - win.sweet) / span, -1, 1);
+      const side = Math.sign(dx) || 1;
+      const oppX = this.game.mode === "training" ? 0 : this.cpu.x;
+      const open = -Math.sign(oppX || side);
+      const bias = clamp(0.55 * open + 0.35 * this.nudge.x, -1, 1);
+      const steered = -side * tau * (0.38 + 0.62 * Math.abs(tau));
+      const aim = clamp(steered + bias * (1 - Math.abs(tau)), -1, 1);
+
+      const finalTag: ShotTag = isDive ? "lob" : shotKey;
+      const sh = SHOT[finalTag];
+      const depth = isDive
+        ? this._rng(6.2, 8.6)
+        : tau > 0
+        ? lerp(sh.depthSweet, sh.depthEarly, tau)
+        : lerp(sh.depthSweet, sh.depthLate, -tau);
+      const miss = isDive ? 0.35 : 0.06 + 0.16 * Math.abs(tau) * (1.05 - 0.28 * power);
+      const tx = aim * (hw - 0.26) + this._rng(-miss, miss);
+      const tz = NET + depth + this._rng(-miss, miss);
+
+      const cross = clamp(tau, 0, 1);
+      const line = clamp(-tau, 0, 1);
+      const mid = 1 - cross - line;
+      const wantMph = sh.T
+        ? 0
+        : ((sh.mphSweet || 80) * mid + (sh.mphCross || 70) * cross + (sh.mphLine || 75) * line) *
+          (0.76 + 0.28 * power);
+      const isCrit = !isDive && (isSmash || (Math.abs(tau) < 0.26 && power >= 0.68));
+
+      const handSign = hitter.handedness === "left" ? -1 : 1;
+      const fore = dx * handSign <= 0;
+      hitter.swingDur = isSmash ? 0.44 : finalTag === "slice" || finalTag === "drop" ? 0.36 : 0.38;
+      hitter.swingT = hitter.swingDur;
+      hitter.swingType = isDive ? "dive" : isSmash ? "smash" : finalTag === "drop" ? "drop" : finalTag === "slice" ? "slice" : finalTag === "lob" ? "lob" : fore ? "fh" : "bh";
+
+      if (isDive) {
+        hitter.diveT = 0.62;
+        hitter.diveDir = -side;
+        hitter.recover = 0.55;
+        hitter.x += Math.sign(dx) * 0.65;
+        this.sfx.dive(hitter.x);
+        this.renderer.vfx.burstDust(hitter.x, hitter.z, 18, this.getActiveVenue().physics.dustColor);
+      } else if (absDx > 1.35) {
+        hitter.lungeT = 0.32;
+        hitter.lungeDir = -side;
+      }
+
+      const mph = launchBall(this.ball, tx, tz, {
+        mph: wantMph,
+        T: isDive ? 1.48 : sh.T,
+        top: sh.top * (0.75 + 0.35 * power),
+        side: sh.side * aim * handSign,
+        clear: isDive ? 2.1 : sh.clear,
+        crit: isCrit,
+        tag: finalTag,
       });
-      this.you.tossArm = 1.0;
-      this.game.phase = "toss";
-      this.game.tossT = 0;
-      this.ui.setHint();
-      return;
-    }
+      this.trail.length = 0;
+      this.lastMph = mph;
+      b.lastHitter = 0;
+      b.lastSlot = hitter.slot;
+      b.serve = false;
 
-    if (ph === "toss") {
-      this.serveHit(power, intent);
-      return;
-    }
-    if (ph !== "rally" && ph !== "training") return;
+      if (!opts?.predictOnly) {
+        this.game.rally++;
+        this.game.strokes++;
+        if (this.game.rally > this.game.stats.longestRally) this.game.stats.longestRally = this.game.rally;
+        if (this.game.rally > this.career.longestRally && this.netCtx === "local") {
+          this.career.longestRally = this.game.rally;
+          saveCareer(this.career);
+        }
+        if (this.game.rally >= 7 && this.game.rally % 4 === 3) {
+          this.sfx.crowdGasp();
+          this.crowd.cheer = Math.max(this.crowd.cheer, 0.38);
+        }
 
-    // Select active near hitter: in Doubles Dual-Control (default), whichever near player is closer to the ball swings!
-    let hitter = this.you;
-    if (this.game.config.discipline === "doubles" && !this.settings.aiPartner && this.game.mode !== "training") {
-      const d0 = Math.hypot(this.ball.x - this.you.x, this.ball.z - this.you.z);
-      const d2 = Math.hypot(this.ball.x - this.partner.x, this.ball.z - this.partner.z);
-      if (d2 < d0 - 0.15) hitter = this.partner;
-    }
+        if (this.game.mode === "training" && this.training.drill === "rally") {
+          this.training.rallyStreak++;
+          this.training.score = Math.max(this.training.score, this.training.rallyStreak);
+          this.ui.updateTrainHud();
+        }
+      }
 
-    const b = this.ball;
-    const useLob = intent === "lob" || (this.game.lobArmed && intent !== "slice" && intent !== "drop");
-    this.game.lobArmed = false;
-    this.ui.updateTelemetry();
+      this.sfx.hit(isDive ? 0.55 : power, isSmash ? "smash" : finalTag, b.x);
+      this.rumbleHit(isSmash ? 130 : isDive ? 95 : isCrit ? 78 : finalTag === "drop" ? 28 : 52);
+      const sparkCol: RGB =
+        finalTag === "drop"
+          ? [0.65, 1.0, 0.72]
+          : finalTag === "slice"
+          ? [0.45, 0.96, 1.0]
+          : isSmash
+          ? [1.0, 0.86, 0.28]
+          : [1.0, 0.68, 0.24];
+      this.triggerImpactJuice(isCrit, false, sparkCol);
 
-    if (!b.live || b.lastHitter !== 1 || (b.serve && b.bounceCount === 0 && b.z > NET)) {
-      hitter.swingT = hitter.swingDur = 0.32;
-      hitter.swingType = "fh";
-      this.ui.feedback("Swing", "wait for the ball");
-      return;
-    }
+      if (isSmash && !opts?.predictOnly) this.lastPointSnapshot = { isBig: true, label: "SMASH REPLAY" };
 
-    const dz = b.z - hitter.z;
-    const dx = b.x - hitter.x;
-    const absDx = Math.abs(dx);
-    const isSmash = b.y >= 1.95 && b.z > NET - 4.8 && absDx < WIN.smash.diveX && dz <= WIN.smash.early && dz >= WIN.smash.late;
-    const isVolley = !isSmash && b.bounceCount === 0 && hitter.z > NET - SVC - 0.8 && dz <= WIN.volley.early && dz >= WIN.volley.late && b.y >= WIN.volley.yLo && b.y <= WIN.volley.yHi;
-    const shotKey: ShotTag = isSmash ? "smash" : isVolley ? "volley" : useLob ? "lob" : intent === "drop" ? "drop" : intent === "slice" ? "slice" : "drive";
-    const win = isSmash ? WIN.smash : isVolley ? WIN.volley : useLob ? WIN.lob : intent === "drop" ? WIN.drop : WIN.ground;
-    const volleyOk = b.bounceCount >= 1 || isVolley || isSmash || b.z > 4.2;
-
-    // Check normal reach vs Automatic Desperation Dive reach!
-    const isDive = absDx > win.x && absDx <= win.diveX && dz <= win.early + 0.25 && dz >= win.late - 0.25 && b.y <= win.yHi && volleyOk && b.z <= NET - 0.25;
-
-    if (!isDive && (b.z > NET - 0.25 || dz > win.early || dz < win.late || absDx > win.x || b.y > win.yHi || !volleyOk)) {
-      hitter.swingT = hitter.swingDur = 0.32;
-      hitter.swingType = dx <= 0 ? "fh" : "bh";
-      if (b.vz < 0 && dz > win.early && dz < 9.5) this.ui.feedback("Too early", "let it come to you");
-      else if (dz < win.late) this.ui.feedback("Too late", "swing sooner");
-      return;
-    }
-
-    const hw = courtHalfWidth(this.game.config.discipline);
-    const span = dz >= win.sweet ? win.early - win.sweet : win.sweet - win.late;
-    const tau = clamp((dz - win.sweet) / span, -1, 1);
-    const side = Math.sign(dx) || 1;
-    const oppX = this.game.mode === "training" ? 0 : this.cpu.x;
-    const open = -Math.sign(oppX || side);
-    const bias = clamp(0.55 * open + 0.35 * this.nudge.x, -1, 1);
-    const steered = -side * tau * (0.38 + 0.62 * Math.abs(tau));
-    const aim = clamp(steered + bias * (1 - Math.abs(tau)), -1, 1);
-
-    const finalTag: ShotTag = isDive ? "lob" : shotKey;
-    const sh = SHOT[finalTag];
-    const depth = isDive
-      ? rand(6.2, 8.6)
-      : tau > 0
-      ? lerp(sh.depthSweet, sh.depthEarly, tau)
-      : lerp(sh.depthSweet, sh.depthLate, -tau);
-    const miss = isDive ? 0.35 : 0.06 + 0.16 * Math.abs(tau) * (1.05 - 0.28 * power);
-    const tx = aim * (hw - 0.26) + rand(-miss, miss);
-    const tz = NET + depth + rand(-miss, miss);
-
-    const cross = clamp(tau, 0, 1);
-    const line = clamp(-tau, 0, 1);
-    const mid = 1 - cross - line;
-    const wantMph = sh.T
-      ? 0
-      : ((sh.mphSweet || 80) * mid + (sh.mphCross || 70) * cross + (sh.mphLine || 75) * line) *
-        (0.76 + 0.28 * power);
-    const isCrit = !isDive && (isSmash || (Math.abs(tau) < 0.26 && power >= 0.68));
-
-    const handSign = hitter.handedness === "left" ? -1 : 1;
-    const fore = dx * handSign <= 0;
-    hitter.swingDur = isSmash ? 0.44 : finalTag === "slice" || finalTag === "drop" ? 0.36 : 0.38;
-    hitter.swingT = hitter.swingDur;
-    hitter.swingType = isDive ? "dive" : isSmash ? "smash" : finalTag === "drop" ? "drop" : finalTag === "slice" ? "slice" : finalTag === "lob" ? "lob" : fore ? "fh" : "bh";
-
-    if (isDive) {
-      hitter.diveT = 0.62;
-      hitter.diveDir = -side;
-      hitter.recover = 0.55;
-      hitter.x += Math.sign(dx) * 0.65;
-      this.sfx.dive(hitter.x);
-      this.renderer.vfx.burstDust(hitter.x, hitter.z, 18, this.getActiveVenue().physics.dustColor);
-    } else if (absDx > 1.35) {
-      hitter.lungeT = 0.32;
-      hitter.lungeDir = -side;
-    }
-
-    const mph = launchBall(this.ball, tx, tz, {
-      mph: wantMph,
-      T: isDive ? 1.48 : sh.T,
-      top: sh.top * (0.75 + 0.35 * power),
-      side: sh.side * aim * handSign,
-      clear: isDive ? 2.1 : sh.clear,
-      crit: isCrit,
-      tag: finalTag,
-    });
-    this.trail.length = 0;
-    this.lastMph = mph;
-    b.lastHitter = 0;
-    b.lastSlot = hitter.slot;
-    b.serve = false;
-
-    this.game.rally++;
-    this.game.strokes++;
-    if (this.game.rally > this.game.stats.longestRally) this.game.stats.longestRally = this.game.rally;
-    if (this.game.rally > this.career.longestRally && this.netCtx === "local") {
-      this.career.longestRally = this.game.rally;
-      saveCareer(this.career);
-    }
-    if (this.game.rally >= 7 && this.game.rally % 4 === 3) {
-      this.sfx.crowdGasp();
-      this.crowd.cheer = Math.max(this.crowd.cheer, 0.38);
-    }
-
-    if (this.game.mode === "training" && this.training.drill === "rally") {
-      this.training.rallyStreak++;
-      this.training.score = Math.max(this.training.score, this.training.rallyStreak);
-      this.ui.updateTrainHud();
-    }
-
-    this.sfx.hit(isDive ? 0.55 : power, isSmash ? "smash" : finalTag, b.x);
-    this.rumbleHit(isSmash ? 130 : isDive ? 95 : isCrit ? 78 : finalTag === "drop" ? 28 : 52);
-    const sparkCol: RGB =
-      finalTag === "drop"
-        ? [0.65, 1.0, 0.72]
-        : finalTag === "slice"
-        ? [0.45, 0.96, 1.0]
+      const label = isDive
+        ? "DIVE SAVE!"
         : isSmash
-        ? [1.0, 0.86, 0.28]
-        : [1.0, 0.68, 0.24];
-    this.triggerImpactJuice(isCrit, false, sparkCol);
+        ? "SMASH!"
+        : isVolley
+        ? "VOLLEY!"
+        : finalTag === "drop"
+        ? "DROP SHOT!"
+        : useLob
+        ? "LOB!"
+        : Math.abs(tau) < 0.26
+        ? isCrit
+          ? "PERFECT!"
+          : "Clean"
+        : tau > 0
+        ? "Early · Cross"
+        : "Late · Line";
+      const detail = `${Math.round(mph)} MPH · ${finalTag === "drop" ? "feather touch" : finalTag === "slice" ? "slice" : finalTag === "lob" ? "high arc" : fore ? "forehand" : "backhand"}`;
+      this.ui.feedback(label, detail, isCrit || isSmash || isDive);
+      this.ui.updateTelemetry(mph, false);
+      this.updateLed();
 
-    if (isSmash) this.lastPointSnapshot = { isBig: true, label: "SMASH REPLAY" };
+      if (!opts?.predictOnly) {
+        if (this.game.mode === "match" || this.game.mode === "tournament" || this.game.mode === "endless" || (this.game.mode === "training" && this.training.drill === "rally")) {
+          this.assignFarPrediction(tx);
+        } else if (this.game.mode === "net") {
+          this.cpu.splitT = 0.24;
+          if (isDbl) this.cpuPartner.splitT = 0.24;
+          this.ui.setNetAimNext?.(this.netActorSlot % 2 === 1 ? "team0" : "team1");
+        }
+      }
 
-    const label = isDive
-      ? "DIVE SAVE!"
-      : isSmash
-      ? "SMASH!"
-      : isVolley
-      ? "VOLLEY!"
-      : finalTag === "drop"
-      ? "DROP SHOT!"
-      : useLob
-      ? "LOB!"
-      : Math.abs(tau) < 0.26
-      ? isCrit
-        ? "PERFECT!"
-        : "Clean"
-      : tau > 0
-      ? "Early · Cross"
-      : "Late · Line";
-    const detail = `${Math.round(mph)} MPH · ${finalTag === "drop" ? "feather touch" : finalTag === "slice" ? "slice" : finalTag === "lob" ? "high arc" : fore ? "forehand" : "backhand"}`;
-    this.ui.feedback(label, detail, isCrit || isSmash || isDive);
-    this.ui.updateTelemetry(mph, false);
-    this.updateLed();
-
-    if (this.game.mode === "match" || this.game.mode === "tournament" || this.game.mode === "endless" || (this.game.mode === "training" && this.training.drill === "rally")) {
-      this.assignFarPrediction(tx);
-    } else if (this.game.mode === "net") {
-      this.cpu.splitT = 0.24;
-      this.ui.setLanAimNext?.(this.netCtx === "guest" ? "host" : "guest");
+      return { connected: true, isServe: false, isToss: false };
+    } finally {
+      this._rng = prevRng;
+      this.netPredictMode = prevPredict;
     }
   }
 
-  private serveHit(power: number, intent: ShotIntent): void {
+  private serveHit(serverP: PlayerState, power: number, intent: ShotIntent): void {
     const dtA = Math.abs(this.game.tossT - TOSS_VY / G);
     const isRocket = dtA <= 0.075 && power >= 0.56 && intent !== "slice";
     const isSlice = intent === "slice";
@@ -717,13 +837,13 @@ export class GameEngine {
       ? Math.sign(this.training.serveTarget.x || 1)
       : serveBoxSign(this.game);
     const e = 1 - tq;
-    const tx = s * rand(0.75, 3.25) + e * rand(-1, 1) * 2.1;
-    const tz = NET + SVC * (0.48 + 0.42 * power) + e * rand(-1, 1.15) * 2.6;
-    const handSign = this.you.handedness === "left" ? -1 : 1;
+    const tx = s * this._rng(0.75, 3.25) + e * this._rng(-1, 1) * 2.1;
+    const tz = NET + SVC * (0.48 + 0.42 * power) + e * this._rng(-1, 1.15) * 2.6;
+    const handSign = serverP.handedness === "left" ? -1 : 1;
 
-    this.you.swingDur = 0.42;
-    this.you.swingT = 0.42;
-    this.you.swingType = "serve";
+    serverP.swingDur = 0.42;
+    serverP.swingT = 0.42;
+    serverP.swingType = "serve";
 
     const mph = launchBall(this.ball, tx, tz, {
       mph: targetMph,
@@ -736,14 +856,14 @@ export class GameEngine {
     });
     this.trail.length = 0;
     this.lastMph = mph;
-    Object.assign(this.ball, { serve: true, lastHitter: 0, lastSlot: 0 });
+    Object.assign(this.ball, { serve: true, lastHitter: 0, lastSlot: serverP.slot });
     this.game.phase = this.game.mode === "training" ? "training" : "rally";
     this.game.strokes = 1;
     this.game.rally = 1;
     this.ui.setHint();
 
     const rMph = Math.round(mph);
-    if (this.netCtx === "local") {
+    if (!this.netPredictMode && this.netCtx === "local") {
       if (rMph > this.game.stats.fastestServe) this.game.stats.fastestServe = rMph;
       if (rMph > this.career.fastestServe) {
         this.career.fastestServe = rMph;
@@ -762,9 +882,11 @@ export class GameEngine {
     this.ui.updateTelemetry(mph, isRocket);
     this.updateLed();
 
+    if (this.netPredictMode) return;
     if (this.game.mode === "net") {
       this.cpu.splitT = 0.24;
-      this.ui.setLanAimNext?.(this.netCtx === "guest" ? "host" : "guest");
+      if (this.game.config.discipline === "doubles") this.cpuPartner.splitT = 0.24;
+      this.ui.setNetAimNext?.(this.netActorSlot % 2 === 1 ? "team0" : "team1");
       return;
     }
     if (this.game.mode !== "training") {
@@ -790,73 +912,89 @@ export class GameEngine {
   }
 
   private cpuServe(): void {
-    const o = CAST[this.game.config.oppId] || CAST.reef;
+    const isDbl = this.game.config.discipline === "doubles" && this.game.mode !== "training";
+    const srvSlot = (isDbl ? this.game.serverSlot : this.game.server) as PlayerSlot;
+    const srvP = this.players[srvSlot] || this.cpu;
+    const isNearServe = srvP.team === 0;
+    const botRid = this.game.mode === "net" ? this.ui.getNetBotRivalId?.(srvSlot) : undefined;
+    const o = CAST[botRid || this.game.config.oppId] || CAST.reef;
     const s = serveBoxSign(this.game);
     let tx = s * rand(0.7, 3.45);
-    let tz = NET - rand(3.5, 6.0);
+    let tz = isNearServe ? NET + rand(3.5, 6.0) : NET - rand(3.5, 6.0);
     if (Math.random() < o.err * 0.65) {
-      if (Math.random() < 0.6) tz = NET - rand(6.6, 7.6);
+      if (Math.random() < 0.6) tz = isNearServe ? NET + rand(6.6, 7.6) : NET - rand(6.6, 7.6);
       else tx = s * rand(4.3, 5.0);
     }
-    this.cpu.swingDur = 0.40;
-    this.cpu.swingT = 0.40;
-    this.cpu.swingType = "serve";
+    srvP.swingDur = 0.40;
+    srvP.swingT = 0.40;
+    srvP.swingType = "serve";
     const paceMult = this.game.mode === "endless" && this.endless ? this.endless.paceMult : 1.0;
     const baseMph = (80 + o.tier * 6.5) * Math.min(1.18, paceMult);
     const mph = launchBall(this.ball, tx, tz, {
       mph: baseMph,
       top: 75 + o.tier * 12,
-      side: 45 * s * (o.avatar.handedness === "left" ? -1 : 1),
+      side: 45 * s * (srvP.handedness === "left" ? -1 : 1),
       clear: 0.20,
       tag: "drive",
     });
     this.trail.length = 0;
     this.lastMph = mph;
-    Object.assign(this.ball, { serve: true, lastHitter: 1, lastSlot: 1 });
+    Object.assign(this.ball, { serve: true, lastHitter: srvP.team, lastSlot: srvP.slot });
     this.game.phase = "rally";
     this.game.strokes = 1;
     this.game.rally = 1;
     this.ui.setHint();
     this.sfx.hit(0.75, "drive", this.ball.x);
     this.ui.updateTelemetry(mph, false);
-    this.you.splitT = 0.24;
-    this.aimNearTeam();
+    if (isNearServe) {
+      this.cpu.splitT = 0.24;
+      if (isDbl) this.cpuPartner.splitT = 0.24;
+      if (this.game.mode === "net") this.ui.setNetAimNext?.("team1");
+      else this.assignFarPrediction(tx);
+    } else {
+      this.you.splitT = 0.24;
+      if (isDbl) this.partner.splitT = 0.24;
+      this.aimNearTeam();
+    }
   }
 
   public aimNearTeam(): void {
     const venue = this.getActiveVenue();
-    const tryVolley = this.you.homeZ > NET - SVC - 0.5;
-    const t = predictBall(this.ball, true, venue, tryVolley, this.you.homeZ);
     const isDbl = this.game.config.discipline === "doubles" && this.game.mode !== "training";
+    const baseP = isDbl && this.partner.role === "baseline" ? this.partner : this.you;
+    const netP = baseP === this.you ? this.partner : this.you;
+
+    const tryVolley = baseP.homeZ > NET - SVC - 0.5;
+    const t = predictBall(this.ball, true, venue, tryVolley, baseP.homeZ);
 
     if (!isDbl) {
-      this.you.aimTarget = { x: t.bx, z: t.bz };
-      const autoX = clamp(t.x - 0.48 * (this.you.handedness === "left" ? -1 : 1), -6.5, 6.5);
+      baseP.aimTarget = { x: t.bx, z: t.bz };
+      const autoX = clamp(t.x - 0.48 * (baseP.handedness === "left" ? -1 : 1), -6.5, 6.5);
       const autoZ = clamp(t.z, -1.75, NET - 1.0);
-      this.you.tx = lerp(this.you.homeX, autoX, 0.84);
-      this.you.tz = lerp(this.you.homeZ, autoZ, 0.84);
+      baseP.tx = lerp(baseP.homeX, autoX, 0.84);
+      baseP.tz = lerp(baseP.homeZ, autoZ, 0.84);
       return;
     }
 
-    // Doubles: split coverage between net player (partner) and baseline player (you)
-    const netT = predictBall(this.ball, true, venue, true, this.partner.homeZ);
+    // Doubles: split coverage between active net player and active baseline player
+    const netT = predictBall(this.ball, true, venue, true, netP.homeZ);
     const nearPartnerIntercept =
-      netT.volley && Math.abs(netT.x - this.partner.x) < 3.4 && this.ball.y < 2.4;
+      netT.volley && Math.abs(netT.x - netP.x) < 3.4 && this.ball.y < 2.4;
 
     if (nearPartnerIntercept) {
-      this.partner.aimTarget = { x: netT.bx, z: netT.bz };
-      this.partner.tx = clamp(netT.x, -5.6, 5.6);
-      this.partner.tz = clamp(netT.z, NET - 5.2, NET - 1.1);
-      this.you.aimTarget = { x: t.bx, z: t.bz };
-      this.you.tx = clamp(t.x * 0.65, -5.2, 5.2);
-      this.you.tz = clamp(t.z, -1.6, NET - 4.0);
+      netP.aimTarget = { x: netT.bx, z: netT.bz };
+      netP.tx = clamp(netT.x, -5.6, 5.6);
+      netP.tz = clamp(netT.z, NET - 5.2, NET - 1.1);
+      baseP.aimTarget = { x: t.bx, z: t.bz };
+      baseP.tx = clamp(t.x * 0.65, -5.2, 5.2);
+      baseP.tz = clamp(t.z, -1.6, NET - 4.0);
     } else {
-      this.you.aimTarget = { x: t.bx, z: t.bz };
-      this.you.tx = lerp(this.you.homeX, clamp(t.x - 0.45, -6.4, 6.4), 0.84);
-      this.you.tz = lerp(this.you.homeZ, clamp(t.z, -1.75, NET - 1.2), 0.84);
-      this.partner.aimTarget = null;
-      this.partner.tx = clamp(-Math.sign(t.x || 1) * 2.1, -4.6, 4.6);
-      this.partner.tz = NET - 3.6;
+      baseP.aimTarget = { x: t.bx, z: t.bz };
+      baseP.tx = lerp(baseP.homeX, clamp(t.x - 0.45, -6.4, 6.4), 0.84);
+      baseP.tz = lerp(baseP.homeZ, clamp(t.z, -1.75, NET - 1.2), 0.84);
+      netP.aimTarget = null;
+      netP.tx = clamp(-Math.sign(t.x || 1) * 2.1, -4.6, 4.6);
+      netP.tz = NET - 3.6;
     }
   }
 
@@ -864,56 +1002,72 @@ export class GameEngine {
     const b = this.ball;
     if (!b.live) return;
 
-    // Optional AI Partner on near side in Doubles!
-    if (
-      this.game.config.discipline === "doubles" &&
-      this.settings.aiPartner &&
-      this.game.mode !== "training" &&
-      this.game.mode !== "net" &&
-      b.lastHitter === 1
-    ) {
+    const isNet = this.game.mode === "net";
+    const isDbl = this.game.config.discipline === "doubles" && this.game.mode !== "training";
+
+    // Near-side AI Partner (offline AI partner OR Net Doubles Bot in slot 2!)
+    const nearBotActive =
+      isDbl &&
+      b.lastHitter === 1 &&
+      (isNet ? this.isNetBotSlot(2) : this.settings.aiPartner);
+
+    if (nearBotActive) {
       const p = this.partner;
       const atNet = p.z > NET - 5.2 && b.bounceCount === 0 && b.z < NET - 0.4 && b.y < 2.25;
-      if (atNet && Math.abs(b.x - p.x) < 1.15 && Math.abs(b.z - p.z) < 0.72) {
-        const rival = CAST[this.game.config.partnerId] || CAST.sunny;
+      const baselineReady = p.role === "baseline" && !b.serve && b.bounceCount === 1 && b.z < NET;
+      if ((atNet || baselineReady) && Math.abs(b.x - p.x) < 1.25 && Math.abs(b.z - p.z) < 0.78 && b.y < 2.55) {
+        const rid = isNet ? this.ui.getNetBotRivalId?.(2) : this.game.config.partnerId;
+        const rival = CAST[rid || "sunny"] || CAST.sunny;
         const dec = chooseAIShot(p, rival, b, this.cpu, "doubles", this.game.rally, 1.0, true);
         p.swingDur = 0.36;
         p.swingT = 0.36;
         p.swingType = dec.tag === "smash" ? "smash" : dec.tag === "slice" ? "slice" : b.x - p.x <= 0 ? "fh" : "bh";
         const mph = launchBall(b, dec.tx, dec.tz, { T: dec.T, top: dec.top, side: dec.side, clear: dec.clear, tag: dec.tag });
         this.trail.length = 0;
+        this.lastMph = mph;
         b.lastHitter = 0;
         b.lastSlot = 2;
+        b.serve = false;
         this.game.rally++;
         this.game.strokes++;
         this.sfx.hit(0.74, dec.tag, b.x);
-        this.ui.feedback("PARTNER VOLLEY!", `${Math.round(mph)} MPH`);
+        this.ui.feedback("PARTNER SHOT!", `${Math.round(mph)} MPH`);
         this.ui.updateTelemetry(mph, false);
-        this.assignFarPrediction(dec.tx);
+        this.updateLed();
+        if (isNet) this.ui.setNetAimNext?.("team1");
+        else this.assignFarPrediction(dec.tx);
         return;
       }
     }
 
-    // Far-side AI (CPU singles, CPU doubles duo, or Rally Endurance partner)
+    // Far-side AI (CPU singles, CPU doubles duo, Rally Endurance partner, OR Net Bot seats 1 / 3!)
     const isAiMode =
       this.game.mode === "match" ||
       this.game.mode === "tournament" ||
       this.game.mode === "endless" ||
       (this.game.mode === "training" && this.training.drill === "rally");
-    if (!isAiMode || b.lastHitter !== 0) return;
+    if (b.lastHitter !== 0) return;
 
-    const farCandidates =
-      this.game.config.discipline === "doubles" && this.game.mode !== "training"
-        ? [this.cpuPartner, this.cpu]
-        : [this.cpu];
+    const farCandidates: PlayerState[] = [];
+    if (isNet) {
+      if (isDbl && this.isNetBotSlot(3)) farCandidates.push(this.cpuPartner);
+      if (this.isNetBotSlot(1)) farCandidates.push(this.cpu);
+      if (farCandidates.length === 0) return;
+    } else if (isAiMode) {
+      if (isDbl) farCandidates.push(this.cpuPartner, this.cpu);
+      else farCandidates.push(this.cpu);
+    } else {
+      return;
+    }
 
     const paceMult = this.game.mode === "endless" && this.endless ? this.endless.paceMult : 1.0;
 
     for (const f of farCandidates) {
-      const rival =
-        f.slot === 3
-          ? CAST[this.game.config.oppPartnerId] || getPartnerRival(this.game.config.oppId)
-          : CAST[this.game.config.oppId] || CAST.reef;
+      const rival = isNet
+        ? CAST[this.ui.getNetBotRivalId?.(f.slot as PlayerSlot) || "reef"] || CAST.reef
+        : f.slot === 3
+        ? CAST[this.game.config.oppPartnerId] || getPartnerRival(this.game.config.oppId)
+        : CAST[this.game.config.oppId] || CAST.reef;
 
       previewAITelegraph(f, rival, b, this.you);
 
@@ -944,7 +1098,7 @@ export class GameEngine {
         const dec = chooseAIShot(f, rival, b, this.you, this.game.config.discipline, this.game.rally, paceMult, false);
         f.swingDur = 0.36;
         f.swingT = 0.36;
-        const hSign = rival.avatar.handedness === "left" ? -1 : 1;
+        const hSign = f.handedness === "left" ? -1 : 1;
         f.swingType = dec.tag === "drop" ? "drop" : dec.tag === "slice" ? "slice" : dec.tag === "smash" ? "smash" : (b.x - f.x) * hSign <= 0 ? "fh" : "bh";
         f.telegraphT = 0;
 
@@ -959,14 +1113,17 @@ export class GameEngine {
         this.lastMph = mph;
         b.lastHitter = 1;
         b.lastSlot = f.slot;
+        b.serve = false;
         this.game.rally++;
         this.game.strokes++;
         this.sfx.hit(0.70, dec.tag, b.x);
         this.ui.updateTelemetry(mph, false);
+        this.updateLed();
         this.you.splitT = 0.24;
+        if (isDbl) this.partner.splitT = 0.24;
         this.aimNearTeam();
 
-        if (f.slot === 1) {
+        if (f.role === "baseline") {
           f.tx = 0;
           f.tz = rival.rush > 0.5 && Math.random() < 0.42 ? NET + 3.4 : L + 0.75;
         } else {
@@ -1225,10 +1382,16 @@ export class GameEngine {
       this.input.rumblePattern(isGame ? [85, 55, 85] : [65]);
       if (isMatch) this.renderer.vfx.burstConfetti(this.you.x, 1.5, this.you.z + 2, 100);
       else if (isGame || reason === "ACE!") this.renderer.vfx.burstConfetti(this.you.x, 1.8, this.you.z + 1.5, 48);
+      if (isNet && this.game.config.discipline === "doubles") {
+        this.ui.onNetEvent?.({ k: "rumP", a: [isGame ? [85, 55, 85] : [65]], slot: 2 });
+      }
     } else {
       this.crowd.cheer = isNet ? (isMatch || isGame || reason === "ACE!" ? 1.0 : 0.55) : 0.25;
       if (isNet) {
-        this.ui.onNetEvent?.({ k: "rumP", a: [isGame ? [85, 55, 85] : [65]] });
+        this.ui.onNetEvent?.({ k: "rumP", a: [isGame ? [85, 55, 85] : [65]], slot: 1 });
+        if (this.game.config.discipline === "doubles") {
+          this.ui.onNetEvent?.({ k: "rumP", a: [isGame ? [85, 55, 85] : [65]], slot: 3 });
+        }
         if (isMatch) this.renderer.vfx.burstConfetti(this.cpu.x, 1.5, this.cpu.z - 2, 100);
         else if (isGame || reason === "ACE!") this.renderer.vfx.burstConfetti(this.cpu.x, 1.8, this.cpu.z - 1.5, 48);
       }
@@ -1265,15 +1428,19 @@ export class GameEngine {
   }
 
   private rumbleHit(ms: number): void {
-    if (this.netCtx === "guest") this.ui.onNetEvent?.({ k: "rum", a: [ms] });
-    else this.input.rumble(ms);
+    if (this.netCtx === "remote") {
+      this.ui.onNetEvent?.({ k: "rum", a: [ms], slot: this.netActorSlot, seq: this.netActorSeq });
+    } else {
+      this.input.rumble(ms);
+    }
   }
 
   public updateLed(): void {
+    const [t0, t1] = this.getTeamNames();
     this.renderer.courtLife.updateLedScoreboard(
       this.game,
-      "You",
-      this.getOppName(),
+      t0,
+      t1,
       this.lastMph,
       this.training.score,
       this.training.time
@@ -1318,16 +1485,22 @@ export class GameEngine {
     }
   }
 
-  public applyNudgeMove(dt: number): void {
+  public applyNudgeForSlot(slot: 0 | 2, nx: number, nz: number, dt: number): void {
     if (this.game.phase === "rally" || this.game.phase === "training") {
-      // Responsive Wii-style D-pad / WASD court shading & net-rush!
-      this.you.homeX = clamp(this.you.homeX + this.nudge.x * 3.4 * dt, -5.6, 5.6);
-      this.you.homeZ = clamp(this.you.homeZ + this.nudge.z * 3.8 * dt, -1.6, NET - 1.15);
+      const p = this.players[slot] || this.you;
+      const zMin = p.role === "net" ? NET - 6.2 : -1.6;
+      const zMax = p.role === "net" ? NET - 1.05 : NET - 1.15;
+      p.homeX = clamp(p.homeX + nx * 3.4 * dt, -5.6, 5.6);
+      p.homeZ = clamp(p.homeZ + nz * 3.8 * dt, zMin, zMax);
       if (!this.ball.live || this.ball.lastHitter !== 1) {
-        this.you.tx = lerp(this.you.tx, this.you.homeX, clamp(dt * 4.5, 0, 1));
-        this.you.tz = lerp(this.you.tz, this.you.homeZ, clamp(dt * 4.5, 0, 1));
+        p.tx = lerp(p.tx, p.homeX, clamp(dt * 4.5, 0, 1));
+        p.tz = lerp(p.tz, p.homeZ, clamp(dt * 4.5, 0, 1));
       }
     }
+  }
+
+  public applyNudgeMove(dt: number): void {
+    this.applyNudgeForSlot(0, this.nudge.x, this.nudge.z, dt);
   }
 
   public update(rawDt: number): void {
@@ -1438,12 +1611,16 @@ export class GameEngine {
       this.game.timer -= dt;
       if (!this.game.tossed && this.game.timer < 0.56) {
         this.game.tossed = true;
+        const isDbl = this.game.config.discipline === "doubles" && this.game.mode !== "training";
+        const srvSlot = (isDbl ? this.game.serverSlot : this.game.server) as PlayerSlot;
+        const srvP = this.players[srvSlot] || this.cpu;
+        const zOff = srvP.team === 0 ? 0.35 : -0.35;
         Object.assign(this.ball, {
-          x: this.cpu.x + 0.18, y: 1.6, z: this.cpu.z - 0.35,
+          x: srvP.x + 0.18, y: 1.6, z: srvP.z + zOff,
           vx: 0, vy: 5.2, vz: 0, w: { x: 0, y: 0, z: 0 },
           visible: true, live: false, netted: false, splashed: false,
         });
-        this.cpu.tossArm = 1.0;
+        srvP.tossArm = 1.0;
       }
       if (this.game.tossed && this.ball.vy < 0.15) this.cpuServe();
     }
@@ -1451,13 +1628,19 @@ export class GameEngine {
     if (ph === "toss") {
       this.game.tossT += dt;
       const yPct = clamp((this.ball.y - 1.1) / 2.1, 0, 1) * 100;
-      this.ui.updateServeMeter(this.game.server === 0, yPct);
+      const isDbl = this.game.config.discipline === "doubles" && this.game.mode !== "training";
+      const srvSlot = (isDbl ? this.game.serverSlot : this.game.server) as PlayerSlot;
+      const showLocalMeter =
+        this.game.mode !== "net"
+          ? this.game.server === 0
+          : srvSlot === 0 || (srvSlot === 2 && this.isTeamDualControl(0));
+      this.ui.updateServeMeter(showLocalMeter, yPct);
       if (this.ball.y < 1.05 && this.ball.vy < 0) {
         this.ball.visible = false;
         this.ui.updateServeMeter(false, 0);
         this.game.phase = "serveReady";
-        if (this.game.server === 0) this.ui.feedback("Missed the toss", "click or swing to toss again");
-        else this.ui.onNetEvent?.({ k: "fb", a: ["Missed the toss", "swing to toss again", false] });
+        if (showLocalMeter) this.ui.feedback("Missed the toss", "click or swing to toss again");
+        else this.ui.onNetEvent?.({ k: "fb", a: ["Missed the toss", "swing to toss again", false], slot: srvSlot });
         this.ui.setHint();
       }
     } else {

@@ -39,6 +39,46 @@ export const DEG = Math.PI / 180;
 export const TAU = Math.PI * 2;
 
 export const rand = (a: number, b: number) => a + Math.random() * (b - a);
+
+/** Deterministic PRNG returning a float in [0, 1) for lockstep-matched swing prediction. */
+export function makeSeededRng(seed: number): (a: number, b: number) => number {
+  let s = (seed | 0) ^ 0x6d2b79f5;
+  return (a: number, b: number) => {
+    s = Math.imul(s + 0x6d2b79f5, 1) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    const u = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    return a + u * (b - a);
+  };
+}
+
+/** Unambiguous room-code alphabet (omits I, O, 0, 1 to prevent verbal/typing mixups). */
+export const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+export function generateRoomCode(): string {
+  let out = "";
+  const buf = typeof crypto !== "undefined" && crypto.getRandomValues
+    ? crypto.getRandomValues(new Uint8Array(4))
+    : null;
+  for (let i = 0; i < 4; i++) {
+    const idx = buf ? buf[i] % ROOM_CODE_ALPHABET.length : Math.floor(Math.random() * ROOM_CODE_ALPHABET.length);
+    out += ROOM_CODE_ALPHABET[idx];
+  }
+  return out;
+}
+
+export function normalizeRoomCode(raw: string): string {
+  return String(raw || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 4);
+}
+
+export function isValidRoomCode(code: string): boolean {
+  return /^[A-Z0-9]{4}$/.test(code);
+}
+
+export const DEFAULT_BOT_RIVALS: [string, string, string, string] = ["sunny", "reef", "koa", "pippa"];
 export const clamp = (v: number, a: number, b: number) => (v < a ? a : v > b ? b : v);
 export const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 export const smoothstep = (e0: number, e1: number, x: number) => {
