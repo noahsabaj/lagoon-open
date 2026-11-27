@@ -1,9 +1,10 @@
-import type { PlayerState } from "../core/types";
+import type { PlayerSlot, PlayerState } from "../core/types";
 import { escHtml } from "./hud";
 
 interface ChatMessage {
   id: number;
   sender: "me" | "peer";
+  senderSlot: PlayerSlot | "spec";
   name: string;
   text: string;
   quick: boolean;
@@ -27,7 +28,7 @@ const POST_QUICK_CHATS: string[] = ["GG!", "Rematch?", "Close one!", "What a mat
 
 export const CHAT_MAX_LEN = 160;
 export const CHAT_COOLDOWN_MS = 350;
-const MAX_HISTORY = 50;
+const MAX_HISTORY = 60;
 const FEED_FADE_MS = 6500;
 const BUBBLE_LIFE_MS = 3400;
 
@@ -45,6 +46,7 @@ interface ChatHooks {
   onSound: (isRemote: boolean) => void;
   getMyName: () => string;
   getPeerName: () => string;
+  getMySlot?: () => PlayerSlot | "spec";
   isLanReady: () => boolean;
   isLiveLanMatch: () => boolean;
 }
@@ -67,7 +69,8 @@ export class ChatController {
   private lastActivityMs = 0;
   private fadeTimer = 0;
 
-  private bubbles: Record<"me" | "peer", ActiveBubble | null> = { me: null, peer: null };
+  // Up to 4 floating court speech bubbles (one per active player slot 0..3!)
+  private bubbles: Array<ActiveBubble | null> = [null, null, null, null];
   private _proj = { x: 0, y: 0, visible: false };
 
   // Live match HUD elements
@@ -78,9 +81,9 @@ export class ChatController {
   private hudMuteBtn: HTMLButtonElement | null = null;
   private hudToggleBtn: HTMLButtonElement | null = null;
   private hudUnreadBadge: HTMLElement | null = null;
-  private bubbleEls: Record<"me" | "peer", HTMLElement | null> = { me: null, peer: null };
+  private bubbleEls: Array<HTMLElement | null> = [null, null, null, null];
 
-  // Currently mounted embedded chat panel (LAN Lobby or Post-Match)
+  // Currently mounted embedded chat panel (Lobby or Post-Match)
   private embeddedHost: HTMLElement | null = null;
   private embeddedFeed: HTMLElement | null = null;
   private embeddedMuteBtn: HTMLButtonElement | null = null;
@@ -98,8 +101,12 @@ export class ChatController {
     this.hudMuteBtn = document.getElementById("chatHudMute") as HTMLButtonElement | null;
     this.hudToggleBtn = document.getElementById("chatHudToggle") as HTMLButtonElement | null;
     this.hudUnreadBadge = document.getElementById("chatHudUnread");
-    this.bubbleEls.me = document.getElementById("chatBubbleMe");
-    this.bubbleEls.peer = document.getElementById("chatBubblePeer");
+    this.bubbleEls = [
+      document.getElementById("chatBubble0"),
+      document.getElementById("chatBubble1"),
+      document.getElementById("chatBubble2"),
+      document.getElementById("chatBubble3"),
+    ];
 
     if (this.hudToggleBtn) {
       this.hudToggleBtn.onclick = () => {
@@ -156,8 +163,13 @@ export class ChatController {
   public toggleMute(): void {
     this.muted = !this.muted;
     if (this.muted) {
-      this.bubbles.peer = null;
-      this.hideBubbleEl("peer");
+      const mySlot = this.hooks.getMySlot ? this.hooks.getMySlot() : 0;
+      for (let i = 0; i < 4; i++) {
+        if (i !== mySlot) {
+          this.bubbles[i] = null;
+          this.hideBubbleEl(i);
+        }
+      }
     } else {
       this.unread = 0;
     }
@@ -231,15 +243,22 @@ export class ChatController {
     this.lastSendMs = nowMs;
 
     const myName = this.hooks.getMyName() || "You";
-    this.pushMessage("me", myName, text, quick, nowMs);
+    const mySlot = this.hooks.getMySlot ? this.hooks.getMySlot() : 0;
+    this.pushMessage("me", mySlot, myName, text, quick, nowMs);
     this.hooks.onSound(false);
     return true;
   }
 
-  public receivePeer(peerName: string, rawText: string, quick = false, nowMs = performance.now()): void {
+  public receivePeer(
+    peerName: string,
+    rawText: string,
+    quick = false,
+    nowMs = performance.now(),
+    senderSlot: PlayerSlot | "spec" = 1
+  ): void {
     const text = sanitizeChatText(rawText);
     if (!text) return;
-    this.pushMessage("peer", peerName || this.hooks.getPeerName() || "Buddy", text, quick, nowMs);
+    this.pushMessage("peer", senderSlot, peerName || this.hooks.getPeerName() || "Buddy", text, quick, nowMs);
     if (!this.muted) {
       this.hooks.onSound(true);
     } else if (!this.isOpen) {
@@ -248,8 +267,15 @@ export class ChatController {
     }
   }
 
-  private pushMessage(sender: "me" | "peer", name: string, text: string, quick: boolean, nowMs: number): void {
-    this.messages.push({ id: this.nextId++, sender, name, text, quick, ts: nowMs });
+  private pushMessage(
+    sender: "me" | "peer",
+    senderSlot: PlayerSlot | "spec",
+    name: string,
+    text: string,
+    quick: boolean,
+    nowMs: number
+  ): void {
+    this.messages.push({ id: this.nextId++, sender, senderSlot, name, text, quick, ts: nowMs });
     if (this.messages.length > MAX_HISTORY) {
       this.messages.splice(0, this.messages.length - MAX_HISTORY);
     }
@@ -261,8 +287,8 @@ export class ChatController {
         this.hudRoot.classList.add("active");
         this.scheduleHudFade();
       }
-      if (this.hooks.isLiveLanMatch()) {
-        this.bubbles[sender] = { name, text, quick, until: nowMs + BUBBLE_LIFE_MS };
+      if (senderSlot !== "spec" && this.hooks.isLiveLanMatch()) {
+        this.bubbles[senderSlot] = { name, text, quick, until: nowMs + BUBBLE_LIFE_MS };
       }
     }
 
@@ -284,10 +310,10 @@ export class ChatController {
     this.messages.length = 0;
     this.unread = 0;
     this.lastActivityMs = 0;
-    this.bubbles.me = null;
-    this.bubbles.peer = null;
-    this.hideBubbleEl("me");
-    this.hideBubbleEl("peer");
+    for (let i = 0; i < 4; i++) {
+      this.bubbles[i] = null;
+      this.hideBubbleEl(i);
+    }
     this.closeComposer();
     this.refreshMuteButtons();
     this.renderFeeds();
@@ -299,22 +325,17 @@ export class ChatController {
     this.hudRoot.hidden = !showLiveHud;
     if (!showLiveHud) {
       if (this.isOpen) this.closeComposer();
-      this.hideBubbleEl("me");
-      this.hideBubbleEl("peer");
+      for (let i = 0; i < 4; i++) this.hideBubbleEl(i);
       return;
     }
     if (this.hudTitle) {
-      this.hudTitle.textContent = `LAN Chat · ${this.hooks.getPeerName() || "Buddy"}`;
+      this.hudTitle.textContent = `Room Chat · ${this.hooks.getPeerName() || "Online"}`;
     }
     if (this.lastActivityMs > 0 && performance.now() - this.lastActivityMs < FEED_FADE_MS) {
       this.hudRoot.classList.add("active");
     }
   }
 
-  /**
-   * Mounts a compact shared chat panel inside the LAN Lobby or Post-Match card
-   * without disturbing existing DOM if already mounted into the same container.
-   */
   public mountEmbedded(container: HTMLElement | null, context: "lobby" | "post"): void {
     if (!container) {
       this.unmountEmbedded();
@@ -328,12 +349,12 @@ export class ChatController {
     this.embeddedHost = container;
     container.dataset.chatCtx = context;
     const quicks = context === "lobby" ? LOBBY_QUICK_CHATS : POST_QUICK_CHATS;
-    const peerName = escHtml(this.hooks.getPeerName() || "Buddy");
+    const roomLabel = escHtml(this.hooks.getPeerName() || "Room");
 
     container.innerHTML = `
       <div class="chat-embed">
         <div class="chat-embed-head">
-          <span class="chat-embed-title">LAN Chat · ${peerName}</span>
+          <span class="chat-embed-title">Room Chat · ${roomLabel}</span>
           <button class="chat-mute-btn" type="button" data-chat-mute>${this.muted ? "Muted" : "Mute"}</button>
         </div>
         <div class="chat-embed-feed" data-chat-feed aria-live="polite"></div>
@@ -341,7 +362,7 @@ export class ChatController {
           ${quicks.map((q) => `<button class="chat-qbtn" type="button" data-eq="${escHtml(q)}">${escHtml(q)}</button>`).join("")}
         </div>
         <div class="chat-embed-bar">
-          <input class="chat-input" type="text" data-chat-input maxlength="${CHAT_MAX_LEN}" autocomplete="off" placeholder="Message ${peerName}…">
+          <input class="chat-input" type="text" data-chat-input maxlength="${CHAT_MAX_LEN}" autocomplete="off" placeholder="Message room…">
           <button class="chat-send-btn" type="button" data-chat-send>Send</button>
         </div>
       </div>
@@ -402,8 +423,17 @@ export class ChatController {
     }
     return slice
       .map((m) => {
+        const roleCls =
+          m.senderSlot === "spec"
+            ? "spec"
+            : m.sender === "me"
+            ? "me"
+            : m.senderSlot % 2 === 0
+            ? "me"
+            : "peer";
         const qCls = m.quick ? " quick" : "";
-        return `<div class="chat-line ${m.sender}${qCls}"><span class="chat-who">${escHtml(m.name)}</span><span class="chat-txt">${escHtml(m.text)}</span></div>`;
+        const badge = m.senderSlot === "spec" ? `<span class="chat-spec-tag">SPEC</span>` : "";
+        return `<div class="chat-line ${roleCls}${qCls}">${badge}<span class="chat-who">${escHtml(m.name)}</span><span class="chat-txt">${escHtml(m.text)}</span></div>`;
       })
       .join("");
   }
@@ -426,8 +456,8 @@ export class ChatController {
     }
   }
 
-  private hideBubbleEl(who: "me" | "peer"): void {
-    const el = this.bubbleEls[who];
+  private hideBubbleEl(slot: number): void {
+    const el = this.bubbleEls[slot];
     if (el) el.hidden = true;
   }
 
@@ -439,18 +469,16 @@ export class ChatController {
     project: (x: number, y: number, z: number, out: { x: number; y: number; visible: boolean }) => void
   ): void {
     const live = this.hooks.isLiveLanMatch();
-    const specs: Array<["me" | "peer", PlayerState | undefined]> = [
-      ["me", players[0]],
-      ["peer", players[1]],
-    ];
+    const mySlot = this.hooks.getMySlot ? this.hooks.getMySlot() : 0;
 
-    for (const [who, player] of specs) {
-      const b = this.bubbles[who];
-      const el = this.bubbleEls[who];
+    for (let i = 0; i < 4; i++) {
+      const b = this.bubbles[i];
+      const el = this.bubbleEls[i];
+      const player = players[i];
       if (!el) continue;
 
-      if (!live || !b || !player || (who === "peer" && this.muted) || nowMs >= b.until) {
-        if (b && nowMs >= b.until) this.bubbles[who] = null;
+      if (!live || !b || !player || (i !== mySlot && this.muted) || nowMs >= b.until) {
+        if (b && nowMs >= b.until) this.bubbles[i] = null;
         el.hidden = true;
         continue;
       }

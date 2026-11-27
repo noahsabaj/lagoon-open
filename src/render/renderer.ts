@@ -22,9 +22,11 @@ import type {
   BallState,
   BounceMark,
   GameState,
+  PlayerSlot,
   PlayerState,
   RGB,
   SkyPreset,
+  SpectatorCamMode,
   TrainingState,
   VenueId,
 } from "../core/types";
@@ -896,10 +898,20 @@ export class GameRenderer {
     you: PlayerState,
     ball: BallState,
     replay: ReplaySystem,
-    trophyCeremony: boolean
+    trophyCeremony: boolean,
+    spectator?: { active: boolean; mode: SpectatorCamMode; followPlayer: PlayerState }
   ): void {
     this.cam.shake = Math.max(0, this.cam.shake - dt * 3.4);
     this.cam.zoomPunch = Math.max(0, this.cam.zoomPunch - dt * 2.4);
+    const inUmpireChair =
+      !!spectator?.active &&
+      spectator.mode === "umpire" &&
+      !replay.active &&
+      !replay.hawkeye.active &&
+      game.phase !== "title" &&
+      game.phase !== "matchOver" &&
+      game.phase !== "trainOver";
+    this.courtLife.setUmpireVisible(!inUmpireChair);
 
     // 1. Hawk-Eye close-line laser zoom camera!
     if (replay.hawkeye.active) {
@@ -979,11 +991,79 @@ export class GameRenderer {
       return;
     }
 
+    // 5b. Live Spectator Camera Modes (Umpire Chair POV, TV Broadcast, Courtside, Follow, Orbit)
+    if (spectator?.active) {
+      const mode = spectator.mode;
+      const bx = ball.visible ? ball.x : 0;
+      const by = ball.visible ? ball.y : 1.0;
+      const bz = ball.visible ? ball.z : NET;
+      let wantEx = 0, wantEy = 7.2, wantEz = -12.0;
+      let wantTx = clamp(bx * 0.25, -3.5, 3.5);
+      let wantTy = clamp(0.85 + by * 0.2, 0.75, 2.2);
+      let wantTz = clamp(bz, 2.0, 21.8);
+      let speed = 5.5;
+
+      if (mode === "umpire") {
+        // Seated inside the high Umpire Chair at (-7.35, 0, NET) looking right in front of the umbrella canopy straight down the net!
+        wantEx = -6.78;
+        wantEy = 2.55;
+        wantEz = NET;
+        wantTx = clamp(bx * 0.50 + 1.2, -3.0, 6.0);
+        wantTy = clamp(0.95 + by * 0.26, 0.85, 2.5);
+        wantTz = clamp(lerp(NET, bz, 0.78), 1.2, 22.5);
+        speed = 7.5;
+      } else if (mode === "broadcast") {
+        wantEx = clamp(bx * 0.16, -2.6, 2.6);
+        wantEy = 7.6;
+        wantEz = -12.6;
+        wantTx = clamp(bx * 0.22, -2.8, 2.8);
+        wantTy = 0.9;
+        wantTz = NET;
+        speed = 4.2;
+      } else if (mode === "courtside") {
+        wantEx = 8.9;
+        wantEy = 1.62;
+        wantEz = NET - 2.4;
+        wantTx = clamp(bx * 0.45, -4.5, 4.5);
+        wantTy = clamp(0.85 + by * 0.25, 0.8, 2.3);
+        wantTz = clamp(bz, 1.5, 22.2);
+        speed = 6.2;
+      } else if (mode === "follow") {
+        const fp = spectator.followPlayer;
+        const farSide = fp.team === 1;
+        wantEx = clamp(fp.x * 0.45, -4.4, 4.4);
+        wantEy = 5.2;
+        wantEz = farSide ? 23.77 + 10.0 : -10.0;
+        wantTx = clamp(bx * 0.24, -2.8, 2.8);
+        wantTy = clamp(0.8 + by * 0.12, 0.8, 1.8);
+        wantTz = NET;
+        speed = 5.0;
+      } else {
+        this.cam.orbitA += dt * 0.20;
+        wantEx = Math.sin(this.cam.orbitA) * 14.2;
+        wantEy = 6.6 + Math.sin(this.cam.orbitA * 1.4) * 0.7;
+        wantEz = NET - Math.cos(this.cam.orbitA) * 19.5;
+        wantTx = 0;
+        wantTy = 1.0;
+        wantTz = NET;
+        speed = 3.2;
+      }
+
+      const k = clamp(dt * speed, 0, 1);
+      this.cam.ex = lerp(this.cam.ex, wantEx, k);
+      this.cam.ey = lerp(this.cam.ey, wantEy, k);
+      this.cam.ez = lerp(this.cam.ez, wantEz, k);
+      this.cam.tx = lerp(this.cam.tx, wantTx, k);
+      this.cam.ty = lerp(this.cam.ty, wantTy, k);
+      this.cam.tz = lerp(this.cam.tz, wantTz, k);
+      return;
+    }
+
     // 6. Standard dynamic Wii-broadcast gameplay camera
     const serving = ph === "serveReady" || ph === "toss";
     const wantEx = serving ? you.x * 0.52 : clamp(you.x * 0.36 + (ball.visible ? ball.x * 0.14 : 0), -4.4, 4.4);
     const wantEy = serving ? 4.75 : 5.45 - this.cam.zoomPunch * 0.35;
-    const wantEz = serving ? -9.2 : -10.2 + clamp((you.z + 0.8) * 0.24, -0.4, 1.9);
+    const wantEz = serving ? -9.2 : -10.2 + clamp((you.z + 0.8) * 0.24, -0.4, 2.3);
     const wantTx = ball.visible ? clamp(ball.x * 0.22, -2.5, 2.5) : you.x * 0.2;
     const wantTy = ball.visible ? clamp(0.75 + ball.y * 0.12, 0.75, 1.75) : 0.95;
     const wantTz = serving ? NET + 0.6 : NET - 0.3;
@@ -1014,8 +1094,12 @@ export class GameRenderer {
     training: TrainingState;
     replay: ReplaySystem;
     trophyCeremony: boolean;
+    focusSlot?: PlayerSlot;
+    isSpectator?: boolean;
   }): void {
     const { now, dt, preset, venueId, game, players, avatars, visibleSlots, ball, netHit, crowdCheer, crowdHop, marks, trail, training, replay, trophyCeremony } = params;
+    const focusSlot: PlayerSlot = params.focusSlot ?? 0;
+    const isSpectator = !!params.isSpectator;
 
     if (this.venues.activeVenue !== venueId) {
       this.venues.setVenue(venueId);
@@ -1056,7 +1140,7 @@ export class GameRenderer {
       const rig = this.ensurePlayerRig(i, avatars[i]);
       rig.root.visible = visibleSlots[i];
       if (visibleSlots[i]) {
-        poseCharacterRig(rig, players[i], ball, now, dt, players[i].team === 0, i === 0);
+        poseCharacterRig(rig, players[i], ball, now, dt, players[i].team === 0, i === focusSlot);
       }
     }
 
@@ -1100,9 +1184,10 @@ export class GameRenderer {
     }
 
     // Overhead smash cue position
-    const you = players[0];
+    const focusP = players[focusSlot] || players[0];
     let smashCuePos: { x: number; z: number } | null = null;
     if (
+      !isSpectator &&
       ball.visible &&
       ball.live &&
       ball.lastHitter === 1 &&
@@ -1130,8 +1215,8 @@ export class GameRenderer {
       ball,
       marks,
       trail,
-      you,
-      avatars[0].trail,
+      focusP,
+      avatars[focusSlot]?.trail || avatars[0].trail,
       overDeck,
       smashCuePos,
       serveTarget,
@@ -1142,12 +1227,14 @@ export class GameRenderer {
           const col: RGB = he.isIn ? [0.22, 0.98, 0.56] : [1.0, 0.28, 0.18];
           this.vfx.drawRing(he.x, 0.032, he.z, 0.26 + Math.sin(now * 14) * 0.04, col, 0.96, 0.65, 1);
         }
-        if (!replay.active && ball.visible && ball.live && ball.lastHitter === 1 && (game.phase === "rally" || game.phase === "training")) {
+        if (!isSpectator && !replay.active && ball.visible && ball.live && ball.lastHitter === 1 && (game.phase === "rally" || game.phase === "training")) {
           const activeNear =
+            focusSlot === 0 &&
             game.config.discipline === "doubles" && visibleSlots[2] &&
-            Math.hypot(ball.x - players[2].x, ball.z - players[2].z) < Math.hypot(ball.x - you.x, ball.z - you.z)
+            Math.hypot(ball.x - players[2].x, ball.z - players[2].z) < Math.hypot(ball.x - focusP.x, ball.z - focusP.z) &&
+            game.mode !== "net"
               ? players[2]
-              : you;
+              : focusP;
           if (activeNear.aimTarget && ball.bounceCount === 0 && activeNear.aimTarget.z < NET) {
             this.vfx.drawRing(
               activeNear.aimTarget.x,

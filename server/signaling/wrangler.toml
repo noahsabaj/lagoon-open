@@ -1,0 +1,10 @@
+name = "lagoon-open-signaling"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[durable_objects]
+bindings = [{ name = "ROOMS", class_name = "RoomSignalingDO" }]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RoomSignalingDO"]

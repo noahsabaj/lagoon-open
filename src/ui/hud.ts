@@ -1,5 +1,5 @@
 import { CAST, QUALITY_TIERS, VENUES } from "../core/constants";
-import type { CareerState, GameState, SettingsState, ShotIntent, TrainingState } from "../core/types";
+import type { CareerState, GameState, PlayerSlot, SettingsState, ShotIntent, SpectatorCamMode, TrainingState } from "../core/types";
 import { getSituationBadge, pointLabel } from "../game/rules";
 
 export const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -106,7 +106,7 @@ export class HudController {
     $("hawkeyeDist").textContent = `${distCm.toFixed(1)} cm · ${lineLabel}`;
   }
 
-  public updateScoreHud(game: GameState, oppName: string): void {
+  public updateScoreHud(game: GameState, oppName: string, team0Name?: string, netBadge = "ONLINE"): void {
     const inMenu = game.phase === "title" || game.phase === "customizer";
     const scoreEl = $("score");
     scoreEl.hidden = game.mode === "training" || inMenu;
@@ -120,12 +120,13 @@ export class HudController {
     if (vLbl) vLbl.textContent = VENUES[game.config.venue].name.toUpperCase();
 
     const o = CAST[game.config.oppId] || CAST.reef;
-    $("youNameHud").textContent = game.config.discipline === "doubles" ? "You + Partner" : "You";
+    $("youNameHud").textContent =
+      team0Name || (game.config.discipline === "doubles" ? "You + Partner" : "You");
     $("modeTagHud").hidden = game.config.discipline !== "doubles";
     $("oppNameHud").textContent = oppName;
     $("oppTierHud").textContent =
       game.mode === "net"
-        ? "LAN"
+        ? netBadge
         : game.mode === "endless"
         ? "ENDLESS"
         : game.mode === "tournament"
@@ -142,6 +143,32 @@ export class HudController {
     const txt = getSituationBadge(game);
     badge.textContent = txt;
     badge.hidden = !txt;
+  }
+
+  public updateSpectatorBar(
+    visible: boolean,
+    camMode: SpectatorCamMode,
+    followSlot: PlayerSlot,
+    watcherCount: number,
+    followLabel?: string
+  ): void {
+    const bar = document.getElementById("specBar");
+    if (!bar) return;
+    bar.hidden = !visible;
+    document.body.classList.toggle("is-spectating", visible);
+    if (!visible) return;
+    const countEl = document.getElementById("specCount");
+    if (countEl) {
+      const n = Math.max(1, watcherCount);
+      countEl.textContent = `LIVE · ${n} watching`;
+    }
+    const followBtn = document.getElementById("specFollowBtn");
+    if (followBtn) {
+      followBtn.textContent = followLabel ? `Follow: ${followLabel}` : `Follow P${followSlot + 1}`;
+    }
+    bar.querySelectorAll<HTMLButtonElement>("[data-scam]").forEach((btn) => {
+      btn.setAttribute("aria-pressed", String(btn.dataset.scam === camMode));
+    });
   }
 
   public updateTrainHud(training: TrainingState, career: CareerState, visible: boolean): void {
@@ -172,9 +199,23 @@ export class HudController {
     $("trBest").textContent = String(Math.max(career.trainingBest[training.drill], training.score));
   }
 
-  public setHint(game: GameState, oppName: string, wiiConnected: boolean, gpConnected: boolean, touchy: boolean, training: TrainingState): void {
+  public setHint(
+    game: GameState,
+    oppName: string,
+    wiiConnected: boolean,
+    gpConnected: boolean,
+    touchy: boolean,
+    training: TrainingState,
+    opts?: { isSpectator?: boolean; myFocusSlot?: PlayerSlot; serverName?: string }
+  ): void {
     const h = $("hint");
     const ph = game.phase;
+    if (opts?.isSpectator && game.mode === "net" && ph !== "title" && ph !== "matchOver") {
+      h.innerHTML = `<strong>Spectating Live.</strong> Press <strong>Tab</strong> to switch camera · <strong>T</strong> chat · <strong>1–4</strong> quick-chat`;
+      h.hidden = false;
+      return;
+    }
+
     const how = wiiConnected
       ? "swing Wii Remote"
       : gpConnected
@@ -183,8 +224,15 @@ export class HudController {
       ? "swipe"
       : "click LMB (hold to charge) or press Space";
     let txt = "";
-    if ((ph === "serveReady" || ph === "toss") && game.server === 1 && game.mode === "net") {
-      txt = `<strong>${escHtml(oppName)} is serving.</strong> Get ready to return! · <strong>T</strong> chat · <strong>1–4</strong> quick-chat`;
+    const isDbl = game.config.discipline === "doubles";
+    const myFocus = opts?.myFocusSlot ?? 0;
+    const isMyServe =
+      game.server === 0 &&
+      (!isDbl || game.mode !== "net" || game.serverSlot === myFocus);
+
+    if ((ph === "serveReady" || ph === "toss") && game.mode === "net" && !isMyServe) {
+      const who = opts?.serverName || oppName;
+      txt = `<strong>${escHtml(who)} is serving.</strong> Get ready! · <strong>T</strong> chat · <strong>1–4</strong> quick-chat`;
     } else if (ph === "serveReady") {
       txt = `<strong>Your serve.</strong> ${cap(how)} to toss, then strike at the golden apex for a <strong>Rocket Serve</strong>!${game.mode === "net" ? " · <strong>T</strong> chat · <strong>1–4</strong> quick" : ""}`;
     } else if (ph === "toss") {

@@ -4,6 +4,7 @@ import {
   clamp,
   CORE_RIVAL_IDS,
   CUSTOMIZER_PALETTES,
+  normalizeRoomCode,
   PRESETS,
   RACKET_CATALOG,
   TRAIL_CATALOG,
@@ -15,6 +16,8 @@ import type {
   HatId,
   MatchDiscipline,
   MatchFormat,
+  NetMode,
+  PlayerSlot,
   RGB,
   SkyId,
   TrainingDrill,
@@ -23,8 +26,8 @@ import type {
 import { saveCareer, saveSettings } from "../game/career";
 import type { GameEngine } from "../game/engine";
 import { rivalDisplayName, tournamentRoundName } from "../game/tournament";
-import type { LanController } from "../net/lan";
-import { NET_PORT } from "../net/lan";
+import type { MultiplayerController } from "../net/session";
+import { NET_PORT, resolveDefaultSignalUrl } from "../net/session";
 import type { ChatController } from "./chat";
 import { $, escHtml, type HudController } from "./hud";
 
@@ -41,10 +44,12 @@ const ICO = {
 
 export class MenuController {
   private wiiMeterInterval: number | null = null;
+  private lobbyTab: NetMode = "online";
+  private joinCodeDraft = "";
 
   constructor(
     private engine: GameEngine,
-    private lan: LanController,
+    private net: MultiplayerController,
     private hud: HudController,
     private chat: ChatController
   ) {}
@@ -74,16 +79,22 @@ export class MenuController {
     this.chat.unmountEmbedded();
     $("overlay").hidden = true;
     $("overlay").classList.remove("side-dock");
-    this.chat.syncHudVisibility(this.lan.connected && this.lan.peer && this.engine.game.mode === "net");
+    this.chat.syncHudVisibility(this.net.connected && this.net.hasAnyPeer && this.engine.game.mode === "net");
   }
 
   public isOverlayOpen(): boolean {
     return !$("overlay").hidden;
   }
 
+  public openJoinRoomCode(code: string): void {
+    this.lobbyTab = "online";
+    this.joinCodeDraft = normalizeRoomCode(code);
+    this.showLanLobby();
+  }
+
   // ---------- MAIN TITLE HUB (2-Column Console Layout, Zero Scroll) ----------
   public showTitle(): void {
-    if (this.engine.game.mode === "net") this.lan.close();
+    if (this.engine.game.mode === "net") this.net.close();
     this.engine.trophyCeremony = false;
     this.engine.replay.stopReplay();
     this.engine.game.mode = "match";
@@ -92,6 +103,7 @@ export class MenuController {
     this.engine.music.setMood("menu");
     this.hud.updateScoreHud(this.engine.game, this.engine.getOppName());
     this.hud.updateTrainHud(this.engine.training, this.engine.career, false);
+    this.hud.updateSpectatorBar(false, this.net.spectatorCamMode, this.net.spectatorFollowSlot, 0);
 
     const cfg = this.engine.game.config;
     const c = this.engine.career;
@@ -234,10 +246,10 @@ export class MenuController {
             <button class="mode-tile lan" id="lanBtn" type="button">
               <div class="mode-tile-top">
                 <span class="mode-ico">${ICO.wifi}</span>
-                <span class="mode-tag">Local Net</span>
+                <span class="mode-tag">Online · LAN</span>
               </div>
-              <span class="mode-nm">LAN Match</span>
-              <span class="mode-sub">Host or join a buddy on Wi-Fi</span>
+              <span class="mode-nm">Online &amp; LAN</span>
+              <span class="mode-sub">4-letter code, 2v2 &amp; Spectate</span>
             </button>
           </div>
         </div>
@@ -789,36 +801,84 @@ export class MenuController {
     $("endHome").onclick = () => this.showTitle();
   }
 
-  // ---------- UPGRADED LAN MULTIPLAYER LOBBY & END ----------
+  private async copyText(text: string, btn: HTMLButtonElement, defaultLabel: string): Promise<void> {
+    let ok = false;
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } catch {
+        ok = false;
+      }
+    }
+    if (!ok) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try {
+        ok = document.execCommand("copy");
+      } catch {
+        ok = false;
+      }
+      document.body.removeChild(ta);
+    }
+    this.engine.sfx.ui();
+    btn.textContent = ok ? "Copied ✓" : "Select & Cmd+C";
+    window.setTimeout(() => {
+      if (btn.isConnected) btn.textContent = defaultLabel;
+    }, 1800);
+  }
+
+  // ---------- ONLINE (4-LETTER CODE) & LOCAL LAN MULTIPLAYER LOBBY ----------
   public showLanLobby(): void {
     this.engine.game.phase = "title";
+    this.hud.updateSpectatorBar(false, this.net.spectatorCamMode, this.net.spectatorFollowSlot, 0);
+    if (this.net.connected) this.lobbyTab = this.net.mode;
+
     const served = location.protocol.startsWith("http") && String(location.port) === String(NET_PORT);
-    const joinVal = this.lan.addr || (served ? location.hostname : "");
-    const lc = this.lan.lobbyConfig;
-    const isGuest = this.lan.role === "guest";
+    const joinVal = this.net.addr || (served ? location.hostname : "");
+    const lc = this.net.lobbyConfig;
+    const isGuest = this.net.role === "guest";
+    const isConnected = this.net.connected;
+    const tab = this.lobbyTab;
 
     this.openCard(
       `
       <div class="top-meta">
-        <div class="eyebrow">LAN Multiplayer · Synced Avatars &amp; Venues</div>
+        <div class="eyebrow">${tab === "online" ? "Online Multiplayer · 4-Letter Room Code · P2P" : "Local LAN · Zero-Internet Wi-Fi"}</div>
         <div class="skill-pill"><span id="lanPill">Offline</span></div>
       </div>
-      <h1>Play a Buddy</h1>
-      <p class="lede">Run <b>python3 lagoon-server.py</b> on the host computer, press <b>Host Game</b>, and share the one-click link with your buddy.</p>
+      <h1>Online &amp; LAN</h1>
 
-      <label class="field">Your Display Name<input id="lanName" maxlength="14" autocomplete="off" spellcheck="false" value="${escHtml(this.lan.myName)}" placeholder="Player"></label>
+      <div class="net-tabs" role="tablist" aria-label="Multiplayer connection mode">
+        <button type="button" class="net-tab" data-nettab="online" aria-pressed="${tab === "online"}" ${isConnected ? "disabled" : ""}>Online (Room Code)</button>
+        <button type="button" class="net-tab" data-nettab="lan" aria-pressed="${tab === "lan"}" ${isConnected ? "disabled" : ""}>Local LAN (Wi-Fi)</button>
+      </div>
+
+      <label class="field">Your Display Name<input id="lanName" maxlength="14" autocomplete="off" spellcheck="false" value="${escHtml(this.net.myName)}" placeholder="Player"></label>
 
       <div class="cust-group">
-        <div class="cust-lbl"><span>Match Settings</span><span class="val-tag">${isGuest ? "Controlled by Host" : "Host Controls"}</span></div>
+        <div class="cust-lbl"><span>Match Settings</span><span class="val-tag" id="lanCtrlTag">${isGuest ? "Controlled by Host" : "Host Controls"}</span></div>
         <div class="split-row">
           <div class="seg">
-            <button type="button" data-ldisc="singles" aria-pressed="${lc.discipline === "singles"}" ${isGuest ? "disabled" : ""}>Singles</button>
-            <button type="button" data-ldisc="doubles" aria-pressed="${lc.discipline === "doubles"}" ${isGuest ? "disabled" : ""}>Doubles</button>
+            <button type="button" data-ldisc="singles" aria-pressed="${lc.discipline === "singles"}" ${isGuest ? "disabled" : ""}>Singles (1v1)</button>
+            <button type="button" data-ldisc="doubles" aria-pressed="${lc.discipline === "doubles"}" ${isGuest ? "disabled" : ""}>Doubles (2v2)</button>
           </div>
           <div class="seg">
             <button type="button" data-lfmt="1game" aria-pressed="${lc.format === "1game"}" ${isGuest ? "disabled" : ""}>1 Game</button>
             <button type="button" data-lfmt="3games" aria-pressed="${lc.format === "3games"}" ${isGuest ? "disabled" : ""}>First to 3</button>
             <button type="button" data-lfmt="6games" aria-pressed="${lc.format === "6games"}" ${isGuest ? "disabled" : ""}>6-Game Set</button>
+          </div>
+        </div>
+        <div class="split-row" id="lanSoloFillRow" ${lc.discipline === "doubles" ? "" : "hidden"}>
+          <span class="note">Empty Doubles Seats:</span>
+          <div class="seg">
+            <button type="button" data-lfill="bot" aria-pressed="${lc.soloDoublesMode === "bot"}" ${isGuest ? "disabled" : ""}>AI Bot Fill</button>
+            <button type="button" data-lfill="dual" aria-pressed="${lc.soloDoublesMode === "dual"}" ${isGuest ? "disabled" : ""}>Dual-Control</button>
           </div>
         </div>
         <div class="split-row">
@@ -831,50 +891,222 @@ export class MenuController {
         </div>
       </div>
 
-      <div class="lan-grid" id="lanConnectGrid">
-        <div class="lan-box"><b>Host</b><span class="note">Runs the server and plays the near court.</span><button class="play alt" id="hostBtn" type="button">Host Game</button></div>
-        <div class="lan-box"><b>Join</b><input id="lanAddr" autocomplete="off" spellcheck="false" placeholder="192.168.1.23" value="${escHtml(joinVal)}" aria-label="Host LAN address"><button class="play alt" id="joinBtn" type="button">Join Game</button></div>
+      <div id="lanConnectGrid">
+        ${
+          tab === "online"
+            ? `
+          <div class="lan-grid">
+            <div class="lan-box">
+              <b>Host Room</b>
+              <span class="note">Instant 4-letter room code for up to 4 players &amp; 6 spectators.</span>
+              <button class="play alt" id="hostBtn" type="button">Host Room</button>
+            </div>
+            <div class="lan-box">
+              <b>Join or Watch</b>
+              <input id="roomCodeInput" class="code-input" maxlength="4" autocomplete="off" spellcheck="false" placeholder="PALM" value="${escHtml(this.joinCodeDraft)}" aria-label="4-letter room code">
+              <div class="join-actions">
+                <button class="play alt" id="joinBtn" type="button">Join Game</button>
+                <button class="play ghost" id="watchBtn" type="button">Watch</button>
+              </div>
+            </div>
+          </div>
+          <details class="adv-signal" style="margin-top:8px">
+            <summary><span>Advanced: Signaling Server</span><span id="sigUrlPreview">${escHtml(this.net.signalUrl)}</span></summary>
+            <div class="adv-signal-body">
+              <input id="signalUrlInput" autocomplete="off" spellcheck="false" value="${escHtml(this.net.signalUrl)}" aria-label="Signaling server URL">
+              <button class="lan-copy-btn" id="sigSaveBtn" type="button">Apply</button>
+              <button class="lan-copy-btn" id="sigResetBtn" type="button">Default</button>
+            </div>
+          </details>
+        `
+            : `
+          <div class="lan-grid">
+            <div class="lan-box">
+              <b>Host LAN</b>
+              <span class="note">Requires <b>python3 lagoon-server.py</b> (port ${NET_PORT}) running locally.</span>
+              <button class="play alt" id="hostLanBtn" type="button">Host LAN</button>
+            </div>
+            <div class="lan-box">
+              <b>Join or Watch LAN</b>
+              <input id="lanAddr" autocomplete="off" spellcheck="false" placeholder="192.168.1.23" value="${escHtml(joinVal)}" aria-label="Host LAN address">
+              <div class="join-actions">
+                <button class="play alt" id="joinLanBtn" type="button">Join Game</button>
+                <button class="play ghost" id="watchLanBtn" type="button">Watch</button>
+              </div>
+            </div>
+          </div>
+        `
+        }
       </div>
 
+      <div id="lanRoomHero" hidden></div>
+      <div id="lanSeatArea" class="seat-section" hidden></div>
       <div class="lan-status" id="lanStatus" aria-live="polite"></div>
       <div id="lanLobbyChat" hidden></div>
       <div class="row">
         <button class="play" id="lanStart" type="button" hidden>${ICO.play}<span>Start Match</span></button>
-        <button class="play ghost" id="lanBack" type="button">Back to Hub</button>
+        <button class="play ghost" id="lanBack" type="button">${isConnected ? "Leave Room" : "Back to Hub"}</button>
       </div>
     `,
       { variant: "wide-card" }
     );
 
-    document.querySelectorAll<HTMLButtonElement>("[data-ldisc]:not(:disabled)").forEach((b) => {
-      b.onclick = () => { this.lan.updateLobbyConfig({ discipline: b.dataset.ldisc as MatchDiscipline }); this.showLanLobby(); };
-    });
-    document.querySelectorAll<HTMLButtonElement>("[data-lfmt]:not(:disabled)").forEach((b) => {
-      b.onclick = () => { this.lan.updateLobbyConfig({ format: b.dataset.lfmt as MatchFormat }); this.showLanLobby(); };
-    });
-    document.querySelectorAll<HTMLButtonElement>("[data-lven]:not(:disabled)").forEach((b) => {
-      b.onclick = () => { this.lan.updateLobbyConfig({ venue: b.dataset.lven as VenueId }); this.showLanLobby(); };
-    });
-    document.querySelectorAll<HTMLButtonElement>("[data-lsky]:not(:disabled)").forEach((b) => {
-      b.onclick = () => { this.lan.updateLobbyConfig({ sky: b.dataset.lsky as SkyId }); this.showLanLobby(); };
+    const nameInput = $("lanName") as HTMLInputElement;
+    nameInput.oninput = () => {
+      this.net.myName = nameInput.value.slice(0, 14);
+    };
+
+    document.querySelectorAll<HTMLButtonElement>("[data-nettab]:not(:disabled)").forEach((b) => {
+      b.onclick = () => {
+        this.engine.sfx.ui();
+        this.lobbyTab = b.dataset.nettab as NetMode;
+        this.net.err = "";
+        this.showLanLobby();
+      };
     });
 
-    $("hostBtn").onclick = () => {
+    document.querySelectorAll<HTMLButtonElement>("[data-ldisc]:not(:disabled)").forEach((b) => {
+      b.onclick = () => {
+        this.engine.sfx.ui();
+        this.net.updateLobbyConfig({ discipline: b.dataset.ldisc as MatchDiscipline });
+        this.showLanLobby();
+      };
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lfmt]:not(:disabled)").forEach((b) => {
+      b.onclick = () => {
+        this.engine.sfx.ui();
+        this.net.updateLobbyConfig({ format: b.dataset.lfmt as MatchFormat });
+        this.showLanLobby();
+      };
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lfill]:not(:disabled)").forEach((b) => {
+      b.onclick = () => {
+        this.engine.sfx.ui();
+        this.net.updateLobbyConfig({ soloDoublesMode: b.dataset.lfill as "bot" | "dual" });
+        this.showLanLobby();
+      };
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lven]:not(:disabled)").forEach((b) => {
+      b.onclick = () => {
+        this.engine.sfx.ui();
+        this.net.updateLobbyConfig({ venue: b.dataset.lven as VenueId });
+        this.showLanLobby();
+      };
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lsky]:not(:disabled)").forEach((b) => {
+      b.onclick = () => {
+        this.engine.sfx.ui();
+        this.net.updateLobbyConfig({ sky: b.dataset.lsky as SkyId });
+        this.showLanLobby();
+      };
+    });
+
+    if (tab === "online") {
+      const codeInput = document.getElementById("roomCodeInput") as HTMLInputElement | null;
+      if (codeInput) {
+        codeInput.oninput = () => {
+          codeInput.value = normalizeRoomCode(codeInput.value);
+          this.joinCodeDraft = codeInput.value;
+        };
+        codeInput.onkeydown = (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            this.net.joinOnline(codeInput.value, ($("lanName") as HTMLInputElement).value, false);
+          }
+        };
+      }
+      const hostBtn = document.getElementById("hostBtn");
+      if (hostBtn) {
+        hostBtn.onclick = () => {
+          this.engine.sfx.ui();
+          this.net.hostOnline(($("lanName") as HTMLInputElement).value);
+        };
+      }
+      const joinBtn = document.getElementById("joinBtn");
+      if (joinBtn) {
+        joinBtn.onclick = () => {
+          this.engine.sfx.ui();
+          const code = (document.getElementById("roomCodeInput") as HTMLInputElement | null)?.value || "";
+          this.net.joinOnline(code, ($("lanName") as HTMLInputElement).value, false);
+        };
+      }
+      const watchBtn = document.getElementById("watchBtn");
+      if (watchBtn) {
+        watchBtn.onclick = () => {
+          this.engine.sfx.ui();
+          const code = (document.getElementById("roomCodeInput") as HTMLInputElement | null)?.value || "";
+          this.net.joinOnline(code, ($("lanName") as HTMLInputElement).value, true);
+        };
+      }
+      const sigSave = document.getElementById("sigSaveBtn");
+      if (sigSave) {
+        sigSave.onclick = () => {
+          const inp = document.getElementById("signalUrlInput") as HTMLInputElement | null;
+          if (!inp) return;
+          this.net.setSignalUrl(inp.value);
+          inp.value = this.net.signalUrl;
+          const prev = document.getElementById("sigUrlPreview");
+          if (prev) prev.textContent = this.net.signalUrl;
+          this.engine.sfx.ui();
+        };
+      }
+      const sigReset = document.getElementById("sigResetBtn");
+      if (sigReset) {
+        sigReset.onclick = () => {
+          try { localStorage.removeItem("lagoon-signal-url"); } catch { /* ignore */ }
+          this.net.signalUrl = resolveDefaultSignalUrl();
+          const inp = document.getElementById("signalUrlInput") as HTMLInputElement | null;
+          if (inp) inp.value = this.net.signalUrl;
+          const prev = document.getElementById("sigUrlPreview");
+          if (prev) prev.textContent = this.net.signalUrl;
+          this.engine.sfx.ui();
+        };
+      }
+    } else {
+      const hostLan = document.getElementById("hostLanBtn");
+      if (hostLan) {
+        hostLan.onclick = () => {
+          this.engine.sfx.ui();
+          this.net.connectLan("host", "localhost", ($("lanName") as HTMLInputElement).value, false);
+        };
+      }
+      const joinLan = document.getElementById("joinLanBtn");
+      if (joinLan) {
+        joinLan.onclick = () => {
+          this.engine.sfx.ui();
+          const addr = (document.getElementById("lanAddr") as HTMLInputElement | null)?.value || "";
+          this.net.connectLan("guest", addr, ($("lanName") as HTMLInputElement).value, false);
+        };
+      }
+      const watchLan = document.getElementById("watchLanBtn");
+      if (watchLan) {
+        watchLan.onclick = () => {
+          this.engine.sfx.ui();
+          const addr = (document.getElementById("lanAddr") as HTMLInputElement | null)?.value || "";
+          this.net.connectLan("guest", addr, ($("lanName") as HTMLInputElement).value, true);
+        };
+      }
+      const lanAddr = document.getElementById("lanAddr") as HTMLInputElement | null;
+      if (lanAddr) {
+        lanAddr.onkeydown = (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            this.net.connectLan("guest", lanAddr.value, ($("lanName") as HTMLInputElement).value, false);
+          }
+        };
+      }
+    }
+
+    $("lanStart").onclick = () => this.net.startHostMatch();
+    $("lanBack").onclick = () => {
       this.engine.sfx.ui();
-      this.lan.connect("host", "localhost", ($("lanName") as HTMLInputElement).value);
-    };
-    $("joinBtn").onclick = () => {
-      this.engine.sfx.ui();
-      this.lan.connect("guest", ($("lanAddr") as HTMLInputElement).value, ($("lanName") as HTMLInputElement).value);
-    };
-    $("lanAddr").onkeydown = (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        this.lan.connect("guest", ($("lanAddr") as HTMLInputElement).value, ($("lanName") as HTMLInputElement).value);
+      if (this.net.connected || this.net.transport) {
+        this.net.close();
+        this.showLanLobby();
+      } else {
+        this.showTitle();
       }
     };
-    $("lanStart").onclick = () => this.lan.startHostMatch();
-    $("lanBack").onclick = () => { this.engine.sfx.ui(); this.lan.close(); this.showTitle(); };
 
     this.refreshLanLobby();
   }
@@ -882,111 +1114,278 @@ export class MenuController {
   public refreshLanLobby(): void {
     const st = document.getElementById("lanStatus");
     if (!st) return;
+
+    const lc = this.net.lobbyConfig;
+    const isGuest = this.net.role === "guest";
+    const isConnected = this.net.connected;
+    const isOnline = this.net.mode === "online";
+
+    // Sync Match Settings toggle states live (so guests see Host's live changes without losing chat focus!)
+    const ctrlTag = document.getElementById("lanCtrlTag");
+    if (ctrlTag) ctrlTag.textContent = isGuest ? "Controlled by Host" : "Host Controls";
+    const fillRow = document.getElementById("lanSoloFillRow");
+    if (fillRow) fillRow.hidden = lc.discipline !== "doubles";
+
+    document.querySelectorAll<HTMLButtonElement>("[data-nettab]").forEach((b) => {
+      b.disabled = isConnected || !!this.net.transport;
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-ldisc]").forEach((b) => {
+      b.setAttribute("aria-pressed", String(b.dataset.ldisc === lc.discipline));
+      b.disabled = isGuest;
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lfmt]").forEach((b) => {
+      b.setAttribute("aria-pressed", String(b.dataset.lfmt === lc.format));
+      b.disabled = isGuest;
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lfill]").forEach((b) => {
+      b.setAttribute("aria-pressed", String(b.dataset.lfill === lc.soloDoublesMode));
+      b.disabled = isGuest;
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lven]").forEach((b) => {
+      b.setAttribute("aria-pressed", String(b.dataset.lven === lc.venue));
+      b.disabled = isGuest;
+    });
+    document.querySelectorAll<HTMLButtonElement>("[data-lsky]").forEach((b) => {
+      b.setAttribute("aria-pressed", String(b.dataset.lsky === lc.sky));
+      b.disabled = isGuest;
+    });
+
+    const connectGrid = document.getElementById("lanConnectGrid");
+    if (connectGrid) connectGrid.hidden = isConnected;
+
+    const backBtn = document.getElementById("lanBack");
+    if (backBtn) backBtn.textContent = isConnected || this.net.transport ? "Leave Room" : "Back to Hub";
+
+    // Room Code / Invite Share Hero
+    const hero = document.getElementById("lanRoomHero");
+    if (hero) {
+      if (isConnected && isOnline && this.net.roomCode) {
+        const shareUrl = this.net.getInviteUrl();
+        hero.hidden = false;
+        hero.innerHTML = `
+          <div class="room-code-hero">
+            <div class="room-code-meta">
+              <span class="room-code-lbl">Room Code · WebRTC P2P</span>
+              <span class="room-code-badge">${escHtml(this.net.roomCode)}</span>
+            </div>
+            <div class="lan-share-row" style="margin-top:0">
+              <code class="lan-url" id="lanShareUrl">${escHtml(shareUrl)}</code>
+              <button class="lan-copy-btn" id="lanCopyBtn" type="button">Copy Invite Link</button>
+              <button class="lan-copy-btn" id="codeCopyBtn" type="button">Copy Code</button>
+            </div>
+          </div>`;
+        const copyLinkBtn = document.getElementById("lanCopyBtn") as HTMLButtonElement | null;
+        if (copyLinkBtn) copyLinkBtn.onclick = () => void this.copyText(shareUrl, copyLinkBtn, "Copy Invite Link");
+        const copyCodeBtn = document.getElementById("codeCopyBtn") as HTMLButtonElement | null;
+        if (copyCodeBtn) copyCodeBtn.onclick = () => void this.copyText(this.net.roomCode, copyCodeBtn, "Copy Code");
+      } else if (isConnected && !isOnline && this.net.role === "host") {
+        const ips = this.net.ips.length
+          ? this.net.ips.map((ip) => `<span class="ip">${escHtml(ip)}</span>`).join(" or ")
+          : "<i>localhost</i>";
+        const shareUrl = this.net.getInviteUrl();
+        hero.hidden = false;
+        hero.innerHTML = `
+          <div class="room-code-hero">
+            <div class="room-code-meta">
+              <span class="room-code-lbl">Local LAN Host</span>
+              <div>${ips}</div>
+            </div>
+            <div class="lan-share-row" style="margin-top:0">
+              <code class="lan-url" id="lanShareUrl">${escHtml(shareUrl)}</code>
+              <button class="lan-copy-btn" id="lanCopyBtn" type="button">Copy Link</button>
+            </div>
+          </div>`;
+        const copyLinkBtn = document.getElementById("lanCopyBtn") as HTMLButtonElement | null;
+        if (copyLinkBtn) copyLinkBtn.onclick = () => void this.copyText(shareUrl, copyLinkBtn, "Copy Link");
+      } else {
+        hero.hidden = true;
+        hero.innerHTML = "";
+      }
+    }
+
+    // Interactive 4-Seat & Spectator Roster Grid
+    const seatArea = document.getElementById("lanSeatArea");
+    if (seatArea) {
+      if (isConnected) {
+        const isDbl = lc.discipline === "doubles";
+        const renderSeat = (slot: PlayerSlot, roleLbl: string) => {
+          const seat = this.net.seats[slot];
+          const peer = seat.peerId ? this.net.peers.get(seat.peerId) : null;
+          const isMine = this.net.mySlot === slot;
+          const isHostSeat = !!peer?.isHost;
+          const isOccupied = seat.kind === "human" && !!peer;
+          const canClick = !isOccupied && this.net.role === "guest";
+          const av = this.net.getSlotAvatar(slot);
+          const name = isOccupied
+            ? peer.name
+            : seat.kind === "dual"
+            ? "Open · Dual-Control"
+            : `Open · ${CAST[seat.botRivalId]?.name || "Bot"} (AI)`;
+          const pillCls = isHostSeat ? "host" : isMine ? "you" : canClick ? "join" : "";
+          const pillTxt = isHostSeat ? "Host" : isMine ? "You" : isOccupied ? `P${slot + 1}` : canClick ? "Sit Here" : seat.kind === "dual" ? "Dual" : "AI";
+          const cardCls = isMine ? "mine" : isOccupied ? "occupied" : "open";
+          return `
+            <button type="button" class="seat-card ${cardCls}" data-seat="${slot}" ${canClick ? "" : "disabled"}>
+              <span class="seat-card-left">
+                <span class="seat-dot" style="background:${cssRgb(av.shirt)};border-color:${cssRgb(av.stripe)}"></span>
+                <span class="seat-name">${escHtml(name)}</span>
+              </span>
+              <span class="seat-pill ${pillCls}">${roleLbl} · ${pillTxt}</span>
+            </button>`;
+        };
+
+        const spectators = this.net.getSpectators();
+        const specChips = spectators.length
+          ? spectators
+              .map((sp) => `<span class="spec-chip">${escHtml(sp.name)}${sp.id === this.net.myPeerId ? " (You)" : ""}</span>`)
+              .join("")
+          : `<span class="note">None yet — up to 6 spectators can watch live.</span>`;
+
+        seatArea.hidden = false;
+        seatArea.innerHTML = `
+          <div class="seat-grid">
+            <div class="seat-team team0">
+              <div class="seat-team-hdr"><span>Team A · Near Court</span><span>${isDbl ? "2 Seats" : "1 Seat"}</span></div>
+              ${renderSeat(0, "P1")}
+              ${isDbl ? renderSeat(2, "P3") : ""}
+            </div>
+            <div class="seat-team team1">
+              <div class="seat-team-hdr"><span>Team B · Far Court</span><span>${isDbl ? "2 Seats" : "1 Seat"}</span></div>
+              ${renderSeat(1, "P2")}
+              ${isDbl ? renderSeat(3, "P4") : ""}
+            </div>
+          </div>
+          <div class="spec-strip">
+            <div class="spec-strip-names">
+              <b>Spectators (${spectators.length}/6):</b>
+              ${specChips}
+            </div>
+            ${
+              this.net.role === "guest"
+                ? `<button type="button" class="spec-switch-btn" id="seatSpecBtn" aria-pressed="${this.net.isSpectator}">${this.net.isSpectator ? "Spectating ✓" : "Watch as Spectator"}</button>`
+                : ""
+            }
+          </div>`;
+
+        seatArea.querySelectorAll<HTMLButtonElement>("[data-seat]:not(:disabled)").forEach((b) => {
+          b.onclick = () => {
+            this.engine.sfx.ui();
+            this.net.requestSeat(Number(b.dataset.seat) as PlayerSlot);
+          };
+        });
+        const specBtn = document.getElementById("seatSpecBtn");
+        if (specBtn) {
+          specBtn.onclick = () => {
+            this.engine.sfx.ui();
+            this.net.requestSeat("spectate");
+          };
+        }
+      } else {
+        seatArea.hidden = true;
+        seatArea.innerHTML = "";
+      }
+    }
+
+    // Status message & Start button
     const pill = document.getElementById("lanPill");
-    const startBtn = document.getElementById("lanStart");
+    const startBtn = document.getElementById("lanStart") as HTMLButtonElement | null;
+    const humans = this.net.getHumanPlayerCount();
+    const specs = this.net.getSpectators().length;
     let html = "";
     let cls = "";
 
-    if (this.lan.ws && !this.lan.connected) {
-      html = `Connecting to <b>${escHtml(this.lan.target)}</b>…`;
-    } else if (this.lan.connected && this.lan.role === "host") {
-      const ips = this.lan.ips.length
-        ? this.lan.ips.map((ip) => `<span class="ip">${escHtml(ip)}</span>`).join(" or ")
-        : "<i>no LAN address found</i>";
-      const shareUrl = `http://${this.lan.ips[0] || location.hostname || "localhost"}:${NET_PORT}`;
-      html = this.lan.peer
-        ? `<b>${escHtml(this.lan.peerName)}</b> joined! Avatar &amp; court synced — press <b>Start Match</b>.`
-        : `Server online. Share:<br>${ips}
-           <div class="lan-share-row">
-             <span class="note">Buddy link:</span>
-             <code class="lan-url" id="lanShareUrl">${escHtml(shareUrl)}</code>
-             <button class="lan-copy-btn" id="lanCopyBtn" type="button">Copy Link</button>
-           </div>`;
+    if (this.net.transport && !isConnected) {
+      html = `Connecting to <b>${escHtml(this.net.target)}</b>…`;
+    } else if (isConnected && this.net.role === "host") {
+      if (this.net.canStartMatch()) {
+        html = `<b>${humans} player${humans > 1 ? "s" : ""}</b>${specs ? ` &amp; <b>${specs} spectator${specs > 1 ? "s" : ""}</b>` : ""} ready — press <b>Start Match</b>!`;
+      } else {
+        html = isOnline
+          ? `Room <b>${escHtml(this.net.roomCode)}</b> is live! Share the code or invite link — waiting for at least 1 opponent to join.`
+          : `LAN room is live! Waiting for a buddy to join on Wi-Fi.`;
+      }
       cls = "ok";
-    } else if (this.lan.connected && this.lan.role === "guest") {
-      html = this.lan.peer
-        ? `Connected to <b>${escHtml(this.lan.peerName)}</b> (${VENUES[this.lan.lobbyConfig.venue].name} · ${this.lan.lobbyConfig.discipline}). Waiting for host to start…`
-        : `Connected to server. Waiting for host to press <b>Host Game</b>…`;
+    } else if (isConnected && this.net.role === "guest") {
+      const roleDesc = this.net.isSpectator
+        ? "Seated as <b>Spectator</b> (Umpire Chair POV)"
+        : `Seated in <b>P${(this.net.mySlot ?? 0) + 1}</b>`;
+      html = this.net.hasAnyPeer
+        ? `Connected! ${roleDesc} · ${VENUES[lc.venue].name} (${lc.discipline}). Waiting for host to start…`
+        : `Connected to server. Waiting for host…`;
       cls = "ok";
     } else {
-      html = this.lan.err || `Not connected. Hosting requires <b>lagoon-server.py</b> (port ${NET_PORT}) running locally.`;
+      html =
+        this.net.err ||
+        (this.lobbyTab === "online"
+          ? `Press <b>Host Room</b> for a 4-letter code, or enter a friend's code to play or spectate.`
+          : `Local LAN uses <b>python3 lagoon-server.py</b> (port ${NET_PORT}) with zero internet required.`);
     }
-    if (this.lan.err && !this.lan.connected) cls = "err";
+    if (this.net.err && !isConnected) cls = "err";
     st.innerHTML = html;
     st.className = "lan-status " + cls;
-    const copyBtn = document.getElementById("lanCopyBtn") as HTMLButtonElement | null;
-    const shareEl = document.getElementById("lanShareUrl");
-    if (copyBtn && shareEl) {
-      copyBtn.onclick = async () => {
-        const url = shareEl.textContent || "";
-        let ok = false;
-        if (navigator.clipboard && window.isSecureContext) {
-          try {
-            await navigator.clipboard.writeText(url);
-            ok = true;
-          } catch {
-            ok = false;
-          }
-        }
-        if (!ok) {
-          const ta = document.createElement("textarea");
-          ta.value = url;
-          ta.style.position = "fixed";
-          ta.style.opacity = "0";
-          document.body.appendChild(ta);
-          ta.focus();
-          ta.select();
-          try {
-            ok = document.execCommand("copy");
-          } catch {
-            ok = false;
-          }
-          document.body.removeChild(ta);
-        }
-        this.engine.sfx.ui();
-        copyBtn.textContent = ok ? "Copied ✓" : "Select & Cmd+C";
-        window.setTimeout(() => {
-          if (copyBtn.isConnected) copyBtn.textContent = "Copy Link";
-        }, 1800);
-      };
+
+    if (pill) {
+      pill.textContent = isConnected
+        ? this.net.hasAnyPeer
+          ? `${humans}P${specs ? ` · ${specs}W` : ""}`
+          : this.net.role === "host"
+          ? isOnline
+            ? `Code ${this.net.roomCode}`
+            : "Hosting"
+          : "Connected"
+        : "Offline";
     }
-    if (pill) pill.textContent = this.lan.connected ? (this.lan.peer ? "Linked" : this.lan.role === "host" ? "Hosting" : "Joined") : "Offline";
-    if (startBtn) startBtn.hidden = !(this.lan.role === "host" && this.lan.peer);
-    const linked = this.lan.connected && this.lan.peer;
-    const connectGrid = document.getElementById("lanConnectGrid");
-    if (connectGrid) connectGrid.hidden = linked;
+    if (startBtn) {
+      startBtn.hidden = !(this.net.role === "host" && isConnected);
+      startBtn.disabled = !this.net.canStartMatch();
+      startBtn.title = this.net.canStartMatch() ? "Start multiplayer match" : "Waiting for at least 2 seated players";
+    }
+
     const chatSlot = document.getElementById("lanLobbyChat");
     if (chatSlot) {
-      chatSlot.hidden = !linked;
-      if (linked) this.chat.mountEmbedded(chatSlot, "lobby");
+      const showChat = isConnected && this.net.hasAnyPeer;
+      chatSlot.hidden = !showChat;
+      if (showChat) this.chat.mountEmbedded(chatSlot, "lobby");
       else this.chat.unmountEmbedded();
     }
   }
 
   public showNetMenu(): void {
+    const modeLabel = this.net.mode === "online" ? `Room ${this.net.roomCode}` : "LAN Match";
+    const summary = this.net.getRoomSummaryName();
     this.openCard(`
-      <div class="eyebrow">LAN Match · Live</div>
-      <h1>Timeout?</h1>
-      <p class="lede">The rally stays live for ${escHtml(this.lan.peerName || "your buddy")} while this menu is open.</p>
+      <div class="eyebrow">${escHtml(modeLabel)} · Live</div>
+      <h1>${this.net.isSpectator ? "Spectator Menu" : "Timeout?"}</h1>
+      <p class="lede">${this.net.isSpectator ? "Switch cameras anytime with Tab or jump back to the live broadcast." : `The rally stays live for ${escHtml(summary)} while this menu is open.`}</p>
       <div class="row">
         <button class="play" id="resumeBtn" type="button">Back to Court</button>
-        <button class="play ghost" id="leaveBtn" type="button">Leave LAN Match</button>
+        <button class="play ghost" id="leaveBtn" type="button">${this.net.isSpectator ? "Stop Watching" : "Leave Match"}</button>
       </div>
     `);
     $("resumeBtn").onclick = () => { this.engine.sfx.ui(); this.closeOverlay(); };
-    $("leaveBtn").onclick = () => { this.engine.sfx.ui(); this.lan.leave(); };
+    $("leaveBtn").onclick = () => { this.engine.sfx.ui(); this.net.leave(); };
   }
 
   public showNetEnd(): void {
     const g = this.engine.game;
-    const isHost = this.lan.role === "host";
-    const stats = isHost ? g.stats : this.lan.peerStats;
+    const isHost = this.net.role === "host";
+    const stats = isHost ? g.stats : this.net.peerStats;
+    const [t0, t1] = this.net.getLocalTeamNames();
+    const headline = this.net.isSpectator
+      ? `${escHtml(g.winner === 0 ? t0 : t1)} Wins!`
+      : g.winner === 0
+      ? "You Win!"
+      : `${escHtml(t1)} Wins`;
+    const eyebrow = this.net.isSpectator
+      ? `${this.net.mode === "online" ? `Room ${this.net.roomCode}` : "LAN Match"} · Final`
+      : `${this.net.mode === "online" ? `Room ${this.net.roomCode}` : "LAN Match"} · ${g.winner === 0 ? "Pier Champion" : "Runner-up"}`;
+
     this.openCard(`
       <div class="top-meta">
-        <div class="eyebrow">LAN Match · ${g.winner === 0 ? "Pier Champion" : "Runner-up"}</div>
+        <div class="eyebrow">${escHtml(eyebrow)}</div>
       </div>
       <div class="final-row">
-        <h1>${g.winner === 0 ? "You Win!" : `${escHtml(this.lan.peerName || "Buddy")} Wins`}</h1>
+        <h1>${headline}</h1>
         <div class="final">${g.games[0]}–${g.games[1]}</div>
       </div>
       <div class="stats-grid">
@@ -995,18 +1394,23 @@ export class MenuController {
         <div class="stat-box"><div class="sv">${stats.winners}</div><div class="sl">Winners</div></div>
         <div class="stat-box"><div class="sv">${stats.longestRally}</div><div class="sl">Max Rally</div></div>
       </div>
-      <p class="lede">${isHost ? "Ready for another? Start an instant rematch for both players." : `Waiting for ${escHtml(this.lan.peerName || "Host")} to start a rematch…`}</p>
+      <p class="lede">${isHost ? "Ready for another? Start an instant rematch for the whole room." : `Waiting for host to start a rematch…`}</p>
       <div id="lanPostChat"></div>
       <div class="row">
         ${isHost ? `<button class="play" id="rematchBtn" type="button">Rematch</button>` : ""}
-        <button class="play ghost" id="leaveBtn" type="button">Leave LAN</button>
+        <button class="play ghost" id="leaveBtn" type="button">Leave Room</button>
       </div>
     `);
     const postChatSlot = document.getElementById("lanPostChat");
-    if (postChatSlot && this.lan.connected && this.lan.peer) {
+    if (postChatSlot && this.net.connected && this.net.hasAnyPeer) {
       this.chat.mountEmbedded(postChatSlot, "post");
     }
-    if (isHost) $("rematchBtn").onclick = () => { if (this.lan.peer) this.lan.startHostMatch(); else this.showLanLobby(); };
-    $("leaveBtn").onclick = () => { this.engine.sfx.ui(); this.lan.leave(); };
+    if (isHost) {
+      $("rematchBtn").onclick = () => {
+        if (this.net.canStartMatch()) this.net.startHostMatch();
+        else this.showLanLobby();
+      };
+    }
+    $("leaveBtn").onclick = () => { this.engine.sfx.ui(); this.net.leave(); };
   }
 }

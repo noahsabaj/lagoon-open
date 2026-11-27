@@ -88,17 +88,32 @@
   </div>
 
   <div id="serveMeter" class="chip" hidden><div class="track"><div class="sweet"></div><div class="pin" id="servePin"></div></div></div>
+
+  <div id="specBar" class="spec-bar chip" hidden aria-label="Spectator camera controls">
+    <span class="spec-live"><i class="spec-dot"></i><span id="specCount">LIVE · 1 watching</span></span>
+    <div class="spec-cams" role="group" aria-label="Camera angle">
+      <button type="button" class="spec-btn" data-scam="umpire" aria-pressed="true">Umpire</button>
+      <button type="button" class="spec-btn" data-scam="broadcast" aria-pressed="false">TV</button>
+      <button type="button" class="spec-btn" data-scam="courtside" aria-pressed="false">Courtside</button>
+      <button type="button" class="spec-btn" data-scam="follow" aria-pressed="false" id="specFollowBtn">Follow P1</button>
+      <button type="button" class="spec-btn" data-scam="orbit" aria-pressed="false">Orbit</button>
+    </div>
+    <button type="button" class="spec-cheer" id="specCheerBtn" title="Send crowd cheer">👏 Cheer</button>
+  </div>
+
   <div id="hint" class="chip" hidden></div>
 
   <div id="chatBubbles" aria-hidden="true">
-    <div id="chatBubbleMe" class="chat-bubble me" hidden></div>
-    <div id="chatBubblePeer" class="chat-bubble peer" hidden></div>
+    <div id="chatBubble0" class="chat-bubble team0" hidden></div>
+    <div id="chatBubble1" class="chat-bubble team1" hidden></div>
+    <div id="chatBubble2" class="chat-bubble team0" hidden></div>
+    <div id="chatBubble3" class="chat-bubble team1" hidden></div>
   </div>
 
   <div id="chatHud" class="chat-hud" hidden>
     <div class="chat-hud-panel chip">
       <div class="chat-hud-head">
-        <span id="chatHudTitle">LAN Chat</span>
+        <span id="chatHudTitle">Room Chat</span>
         <div class="chat-hud-actions">
           <button id="chatHudMute" class="chat-mute-btn" type="button" aria-pressed="false">Mute</button>
           <button id="chatHudClose" class="chat-close-btn" type="button" title="Close (Esc)">Esc</button>
@@ -107,11 +122,11 @@
       <div id="chatHudFeed" class="chat-hud-feed" aria-live="polite"></div>
       <div id="chatHudQuick" class="chat-hud-quick"></div>
       <div class="chat-hud-bar">
-        <input id="chatHudInput" class="chat-input" type="text" maxlength="160" autocomplete="off" placeholder="Message buddy… (Enter to send)">
+        <input id="chatHudInput" class="chat-input" type="text" maxlength="160" autocomplete="off" placeholder="Message room… (Enter to send)">
         <button id="chatHudSend" class="chat-send-btn" type="button">Send</button>
       </div>
     </div>
-    <button id="chatHudToggle" class="chat-launcher chip" type="button" title="Open LAN Chat (T or Enter)">
+    <button id="chatHudToggle" class="chat-launcher chip" type="button" title="Open Room Chat (T or Enter)">
       <svg class="tico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
       <span>Chat</span>
       <kbd>T</kbd>

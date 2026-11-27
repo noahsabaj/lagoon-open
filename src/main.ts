@@ -1,12 +1,13 @@
 import "./styles/main.css";
-import { QUALITY_TIERS, SKY_CYCLE } from "./core/constants";
+import { isValidRoomCode, normalizeRoomCode, QUALITY_TIERS, SKY_CYCLE } from "./core/constants";
+import type { PlayerSlot, SpectatorCamMode } from "./core/types";
 import { SoundEngine } from "./audio/soundEngine";
 import { TropicalMusicEngine } from "./audio/music";
 import { UmpireVoice } from "./audio/umpireVoice";
 import { loadCareer, loadSettings, saveSettings } from "./game/career";
 import { GameEngine } from "./game/engine";
 import { InputController } from "./input/controls";
-import { LanController } from "./net/lan";
+import { MultiplayerController } from "./net/session";
 import { AssetManager } from "./render/assets";
 import { GameRenderer } from "./render/renderer";
 import { ChatController } from "./ui/chat";
@@ -47,9 +48,48 @@ async function boot() {
 
   // Forward declarations resolved right after instantiation
   let engine!: GameEngine;
-  let lan!: LanController;
+  let net!: MultiplayerController;
   let menus!: MenuController;
   let chat!: ChatController;
+
+  const syncScoreHud = () => {
+    const [t0, t1] = engine.getTeamNames();
+    const badge = net.mode === "online" ? `ROOM ${net.roomCode || ""}`.trim() : "LAN";
+    hud.updateScoreHud(engine.game, t1, engine.game.mode === "net" ? t0 : undefined, badge);
+  };
+
+  const syncHint = () => {
+    const g = engine.game;
+    const isNet = g.mode === "net";
+    const srvSlot = (g.config.discipline === "doubles" ? g.serverSlot : g.server) as PlayerSlot;
+    const canonicalSrv = (isNet && net.isMirroredView ? (srvSlot ^ 1) : srvSlot) as PlayerSlot;
+    const serverName = isNet ? net.getSlotName(canonicalSrv) : engine.getOppName();
+    hud.setHint(
+      g,
+      engine.getOppName(),
+      !!input.wii.dev,
+      input.gamepad.connected,
+      input.touchy,
+      engine.training,
+      {
+        isSpectator: net.isSpectator,
+        myFocusSlot: net.localFocusSlot,
+        serverName,
+      }
+    );
+  };
+
+  const syncSpectatorBar = () => {
+    const vis = net.isSpectator && engine.game.mode === "net" && engine.game.phase !== "title" && engine.game.phase !== "matchOver";
+    const followName = net.getSlotName(net.spectatorFollowSlot);
+    hud.updateSpectatorBar(
+      vis,
+      net.spectatorCamMode,
+      net.spectatorFollowSlot,
+      net.getSpectators().length,
+      followName
+    );
+  };
 
   const input = new InputController(cv, settings, {
     onSwing: (pwr, intent) => engine.humanSwing(pwr, intent),
@@ -74,7 +114,7 @@ async function boot() {
     },
     onOverlayConfirm: () => {
       if (engine.game.paused) { engine.game.paused = false; menus.closeOverlay(); }
-      else if (engine.game.phase === "title" && !lan.ws) { menus.closeOverlay(); engine.startMatch(); }
+      else if (engine.game.phase === "title" && !net.transport) { menus.closeOverlay(); engine.startMatch(); }
     },
     onSkipReplay: () => engine.skipBroadcastOverlay(),
     onAudioUnlock: () => {
@@ -84,20 +124,22 @@ async function boot() {
     onWiiStatusChange: (connected, label, msg) => {
       hud.updateWiiToolbar(connected, label);
       if (msg) hud.showMsg(msg[0], msg[1], 2400);
-      hud.setHint(engine.game, engine.getOppName(), connected, input.gamepad.connected, input.touchy, engine.training);
+      syncHint();
     },
     onGamepadStatusChange: (connected, label) => {
       hud.updateGamepadToolbar(connected, label);
       if (connected) hud.showMsg("Gamepad Connected", "A Drive · B Slice · X Drop · Y Lob", 2000);
-      hud.setHint(engine.game, engine.getOppName(), !!input.wii.dev, connected, input.touchy, engine.training);
+      syncHint();
     },
     isOverlayOpen: () => menus.isOverlayOpen(),
     isServeReady: () => engine.game.phase === "serveReady",
     isChatOpen: () => chat.isOpen,
-    canChat: () => lan.connected && lan.peer && engine.game.mode === "net",
+    canChat: () => net.connected && net.hasAnyPeer && engine.game.mode === "net",
     onChatOpen: () => chat.openComposer(),
     onChatClose: () => chat.closeComposer(),
     onQuickChat: (slot) => { chat.sendQuick(slot); },
+    isSpectator: () => net.isSpectator && engine.game.mode === "net",
+    onSpectatorCycleCam: () => { sfx.ui(); net.cycleSpectatorCamera(); },
     getViewportSize: () => [renderer.W, renderer.H],
     getHandedness: () => career.avatar.handedness,
   });
@@ -105,19 +147,24 @@ async function boot() {
   engine = new GameEngine(career, settings, renderer, sfx, music, umpire, input, {
     showMsg: (big, small, ms) => hud.showMsg(big, small, ms),
     feedback: (label, detail, isCrit) => {
-      if (engine.netCtx === "guest") lan.pushEvent({ k: "fb", a: [label, detail || "", !!isCrit] });
-      else hud.feedback(label, detail, isCrit);
+      if (engine.netCtx === "remote") {
+        net.pushEvent({ k: "fb", a: [label, detail || "", !!isCrit], slot: engine.netActorSlot, seq: engine.netActorSeq });
+      } else {
+        hud.feedback(label, detail, isCrit);
+      }
     },
-    updateHud: () => hud.updateScoreHud(engine.game, engine.getOppName()),
+    updateHud: () => syncScoreHud(),
     updateTrainHud: () => hud.updateTrainHud(engine.training, career, engine.game.mode === "training"),
     updateTelemetry: (mph, isRocket) => {
-      if (mph && mph > 20 && lan.isHostLive()) lan.pushEvent({ k: "tel", a: [mph, !!isRocket] });
-      if (engine.netCtx !== "guest") hud.updateTelemetry(engine.game, mph, isRocket);
+      if (mph && mph > 20 && net.isHostLive() && !engine.netPredictMode) {
+        net.pushEvent({ k: "tel", a: [mph, !!isRocket], seq: engine.netActorSeq });
+      }
+      if (engine.netCtx !== "remote") hud.updateTelemetry(engine.game, mph, isRocket);
     },
     updateServeMeter: (v, p) => hud.updateServeMeter(v, p),
     setHint: () => {
-      if (engine.netCtx === "guest") return;
-      hud.setHint(engine.game, engine.getOppName(), !!input.wii.dev, input.gamepad.connected, input.touchy, engine.training);
+      if (engine.netCtx === "remote") return;
+      syncHint();
     },
     showEnd: () => menus.showEnd(),
     showTrainEnd: () => menus.showTrainEnd(),
@@ -125,40 +172,68 @@ async function boot() {
     showEndlessResult: () => menus.showEndlessResult(),
     updateReplayBanner: (vis, lbl) => hud.updateReplayBanner(vis, lbl),
     updateHawkEyeBanner: (vis, isIn, cm, line) => hud.updateHawkEyeBanner(vis, isIn, cm, line),
-    onNetEvent: (e) => lan.pushEvent(e),
-    isLanGuest: () => lan.role === "guest",
-    onLanGuestSwing: (p, i) => lan.guestSwing(p, i),
-    getLanPeerName: () => lan.peerName,
-    getLanPeerAvatar: () => lan.peerAvatar,
-    getLanRole: () => lan.role,
-    setLanAimNext: (who) => { lan.aimNext = who; },
+    onNetEvent: (e) => net.pushEvent(e),
+    isNetRemoteClient: () => net.isRemoteClient(),
+    isNetSpectator: () => net.isSpectator,
+    onNetGuestSwing: (p, i) => net.guestSwing(p, i),
+    getNetTeamNames: () => net.getLocalTeamNames(),
+    getNetSlotAvatars: () => net.getLocalSlotAvatars(),
+    getNetSeatKinds: () => net.getSeatKinds(),
+    getNetBotRivalId: (slot) => net.getBotRivalId(slot),
+    setNetAimNext: (who) => { net.aimNext = who; },
   });
 
-  lan = new LanController(engine, {
+  net = new MultiplayerController(engine, {
     refreshLobby: () => menus.refreshLanLobby(),
     showTitle: () => menus.showTitle(),
-    showNetEnd: () => menus.showNetEnd(),
+    showNetEnd: () => { syncSpectatorBar(); menus.showNetEnd(); },
     showMsg: (b, s, m) => hud.showMsg(b, s, m),
     feedback: (l, d, c) => hud.feedback(l, d, c),
     updateTelemetry: (m, r) => hud.updateTelemetry(engine.game, m, r),
-    updateHud: () => hud.updateScoreHud(engine.game, engine.getOppName()),
-    setHint: () => hud.setHint(engine.game, engine.getOppName(), !!input.wii.dev, input.gamepad.connected, input.touchy, engine.training),
+    updateHud: () => syncScoreHud(),
+    setHint: () => syncHint(),
     updatePing: (ms) => hud.updatePing(ms),
-    hideOverlayForMatch: () => menus.closeOverlay(),
-    onChat: (peerName, text, quick) => chat.receivePeer(peerName, text, quick),
+    updateSpectatorBar: () => syncSpectatorBar(),
+    hideOverlayForMatch: () => { menus.closeOverlay(); syncSpectatorBar(); },
+    onChat: (senderName, senderSlot, text, quick) => chat.receivePeer(senderName, text, quick, undefined, senderSlot),
     onChatReset: () => chat.clearSession(),
   });
 
   chat = new ChatController({
-    onSend: (text, quick) => lan.sendChat(text, quick),
+    onSend: (text, quick) => net.sendChat(text, quick),
     onSound: (isRemote) => { sfx.init(); sfx.chat(isRemote); },
-    getMyName: () => lan.myName || "You",
-    getPeerName: () => lan.peerName || "Buddy",
-    isLanReady: () => lan.connected && lan.peer,
-    isLiveLanMatch: () => lan.connected && lan.peer && engine.game.mode === "net" && !menus.isOverlayOpen(),
+    getMyName: () => net.myName || "You",
+    getPeerName: () => net.getRoomSummaryName(),
+    getMySlot: () => (net.isSpectator ? "spec" : net.localFocusSlot),
+    isLanReady: () => net.connected && net.hasAnyPeer,
+    isLiveLanMatch: () => net.connected && net.hasAnyPeer && engine.game.mode === "net" && !menus.isOverlayOpen(),
   });
 
-  menus = new MenuController(engine, lan, hud, chat);
+  menus = new MenuController(engine, net, hud, chat);
+
+  // Spectator bar controls (camera buttons + crowd cheer reaction)
+  document.querySelectorAll<HTMLButtonElement>("#specBar [data-scam]").forEach((btn) => {
+    btn.onclick = () => {
+      sfx.init(); sfx.ui();
+      const cam = btn.dataset.scam as SpectatorCamMode;
+      if (cam === "follow" && net.spectatorCamMode === "follow") {
+        const maxSlots = engine.game.config.discipline === "doubles" ? 4 : 2;
+        const nextSlot = ((net.spectatorFollowSlot + 1) % maxSlots) as PlayerSlot;
+        net.setSpectatorCamera("follow", nextSlot);
+      } else {
+        net.setSpectatorCamera(cam);
+      }
+    };
+  });
+  const specCheerBtn = document.getElementById("specCheerBtn");
+  if (specCheerBtn) {
+    specCheerBtn.onclick = () => {
+      sfx.init();
+      if (net.sendSpectatorCheer()) {
+        hud.feedback("CHEER!", "Crowd goes wild!");
+      }
+    };
+  }
 
   // Toolbar controls
   $("wiiBtn").onclick = () => { sfx.init(); void input.connectWii(true); };
@@ -203,7 +278,14 @@ async function boot() {
   window.addEventListener("resize", () => renderer.resize());
 
   hud.updateToolbar(settings, engine.getActiveSkyPreset().label);
-  menus.showTitle();
+
+  // Deep-link `?room=PALM` opens straight into the Online Join lobby with code pre-filled!
+  const urlRoom = normalizeRoomCode(new URLSearchParams(location.search).get("room") || "");
+  if (isValidRoomCode(urlRoom)) {
+    menus.openJoinRoomCode(urlRoom);
+  } else {
+    menus.showTitle();
+  }
   void input.connectWii(false);
 
   // Main animation loop + adaptive FPS quality safeguard
@@ -220,12 +302,12 @@ async function boot() {
 
     input.poll(ts);
 
-    if (lan.role === "guest" && engine.game.mode === "net") {
-      lan.guestTick(dt);
+    if (net.role === "guest" && engine.game.mode === "net") {
+      net.guestTick(dt);
     } else {
-      if (engine.game.mode === "net") lan.hostStep(dt);
+      if (engine.game.mode === "net") net.hostStep(dt);
       engine.update(dt);
-      lan.hostSendSnapshot();
+      net.hostSendSnapshot();
     }
 
     renderer.render({
@@ -246,6 +328,8 @@ async function boot() {
       training: engine.training,
       replay: engine.replay,
       trophyCeremony: engine.trophyCeremony,
+      focusSlot: engine.game.mode === "net" ? net.localFocusSlot : 0,
+      isSpectator: engine.game.mode === "net" && net.isSpectator,
     });
 
     chat.updateBubbles(

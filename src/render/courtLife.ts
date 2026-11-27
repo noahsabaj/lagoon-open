@@ -255,6 +255,10 @@ export class CourtLife {
     this.ledTex.needsUpdate = true;
   }
 
+  public setUmpireVisible(visible: boolean): void {
+    this.umpireRig.root.visible = visible;
+  }
+
   public update(t: number, cheer: number, hop: number, ball: BallState): void {
     // Throttle crowd matrix uploads: 60Hz during active cheering, 30Hz during gentle idle sway (zero GC!)
     const minStep = cheer > 0.05 ? 1 / 60 : 1 / 30;
