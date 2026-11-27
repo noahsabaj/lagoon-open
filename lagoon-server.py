@@ -2,28 +2,49 @@
 """
 Lagoon Open - LAN server (macOS / Windows / Linux, Python 3 standard library only)
 
-Relays WebSocket messages between the host and guest browsers, and also serves the
-game page so a buddy can simply browse to http://<host-address>:8765
+Relays WebSocket messages between host and guest browsers, and serves the built Vite
+game bundle from ./dist/ (including .html, .js, .css, .glb 3D models, and offline fonts)
+so a buddy can simply browse to http://<host-address>:8765
 
+Build first:   npm install && npm run build
 Run it with:   python3 lagoon-server.py          (Mac / Linux, from this folder)
                py lagoon-server.py               (Windows)
 Optional port: python3 lagoon-server.py 9000
 Stop it with Ctrl+C (or close the window).
 """
 import base64
+import collections
 import hashlib
 import json
+import mimetypes
 import os
 import socket
 import struct
 import sys
 import threading
+import urllib.parse
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
 HERE = os.path.dirname(os.path.abspath(__file__))
-HTML = os.path.join(HERE, "lagoon-open-3d.html")
+DIST = os.path.join(HERE, "dist")
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_FRAME = 4 * 1024 * 1024
+
+MIME_EXTRA = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".ico": "image/x-icon",
+}
 
 clients = []
 clients_lock = threading.Lock()
@@ -35,7 +56,6 @@ def log(msg):
         print(msg, flush=True)
 
 
-# ---------------------------------------------------------------- LAN address discovery
 def ip_rank(ip):
     if ip.startswith("192.168."):
         return 0
@@ -44,7 +64,7 @@ def ip_rank(ip):
     if ip.startswith("172."):
         try:
             if 16 <= int(ip.split(".")[1]) <= 31:
-                return 3  # usually virtual adapters (Docker / Hyper-V / WSL)
+                return 3
         except ValueError:
             pass
     return 2
@@ -52,7 +72,6 @@ def ip_rank(ip):
 
 def lan_ips():
     ips = set()
-    # The OS picks the outgoing interface for a UDP "connect"; no packet is actually sent.
     for probe in ("10.255.255.255", "192.168.255.255", "8.8.8.8"):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -70,17 +89,19 @@ def lan_ips():
     return sorted(ips, key=lambda ip: (ip_rank(ip), ip))
 
 
-# ---------------------------------------------------------------- WebSocket plumbing
 class Client:
     def __init__(self, sock, addr):
         self.sock = sock
         self.addr = addr
-        self.lock = threading.Lock()
         self.alive = True
+        self._cond = threading.Condition()
+        self._reliable = collections.deque()
+        self._latest_snap = None
+        self._writer = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer.start()
 
-    def send(self, opcode, data):
-        if not self.alive:
-            return
+    @staticmethod
+    def _frame(opcode, data):
         n = len(data)
         if n < 126:
             hdr = struct.pack("!BB", 0x80 | opcode, n)
@@ -88,20 +109,54 @@ class Client:
             hdr = struct.pack("!BBH", 0x80 | opcode, 126, n)
         else:
             hdr = struct.pack("!BBQ", 0x80 | opcode, 127, n)
-        try:
-            with self.lock:
-                self.sock.sendall(hdr + data)
-        except OSError:
+        return hdr + data
+
+    def send(self, opcode, data, coalescable=False):
+        if not self.alive:
+            return
+        pkt = self._frame(opcode, data)
+        with self._cond:
+            if not self.alive:
+                return
+            if coalescable:
+                # Overwrite any unsent pure state snapshot so Wi-Fi hiccups never cause bufferbloat!
+                self._latest_snap = pkt
+            else:
+                if len(self._reliable) > 128:
+                    self._reliable.popleft()
+                self._reliable.append(pkt)
+            self._cond.notify()
+
+    def close(self):
+        with self._cond:
             self.alive = False
+            self._cond.notify_all()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _write_loop(self):
+        while True:
+            with self._cond:
+                while self.alive and not self._reliable and self._latest_snap is None:
+                    self._cond.wait(timeout=1.0)
+                if not self.alive:
+                    return
+                # Reliable control/event/ping packets always preempt coalescable state snapshots
+                if self._reliable:
+                    pkt = self._reliable.popleft()
+                else:
+                    pkt = self._latest_snap
+                    self._latest_snap = None
             try:
-                self.sock.close()
+                self.sock.sendall(pkt)
             except OSError:
-                pass
+                self.close()
+                return
 
 
 class Reader:
-    """Buffered socket reader so bytes that arrive after the HTTP headers are never lost."""
-
     def __init__(self, sock):
         self.sock = sock
         self.buf = b""
@@ -152,12 +207,18 @@ def broadcast(data):
         c.send(1, data)
 
 
+def is_coalescable_snapshot(opcode, data):
+    # Pure periodic state snapshot without embedded events/phase-critical flags
+    return opcode == 1 and data.startswith(b'{"t":"s",') and b'"ev":[' not in data
+
+
 def relay(sender, opcode, data):
+    coalescable = is_coalescable_snapshot(opcode, data)
     with clients_lock:
         snap = list(clients)
     for c in snap:
         if c is not sender:
-            c.send(opcode, data)
+            c.send(opcode, data, coalescable=coalescable)
 
 
 def ws_loop(client, reader):
@@ -179,13 +240,13 @@ def ws_loop(client, reader):
         data = reader.read_exact(n)
         if mask:
             data = unmask(data, mask)
-        if op == 8:  # close
+        if op == 8:
             client.send(8, b"")
             return
-        if op == 9:  # ping
+        if op == 9:
             client.send(10, data)
             continue
-        if op == 10:  # pong
+        if op == 10:
             continue
         if op in (1, 2):
             frag = bytearray()
@@ -196,17 +257,39 @@ def ws_loop(client, reader):
             frag = bytearray()
 
 
+def resolve_dist_file(url_path):
+    clean = urllib.parse.unquote(url_path.split("?", 1)[0])
+    if clean in ("", "/", "/index.html"):
+        rel = "index.html"
+    else:
+        rel = clean.lstrip("/")
+    dist_real = os.path.realpath(DIST)
+    full = os.path.realpath(os.path.join(dist_real, rel))
+    if not (full == dist_real or full.startswith(dist_real + os.sep)):
+        return None
+    if os.path.isfile(full):
+        return full
+    return None
+
+
 def serve_http(sock, path):
-    path = path.split("?", 1)[0]
-    if path in ("/", "/index.html", "/lagoon-open-3d.html") and os.path.isfile(HTML):
-        with open(HTML, "rb") as f:
+    fp = resolve_dist_file(path)
+    if fp:
+        with open(fp, "rb") as f:
             body = f.read()
-        status, ctype = "200 OK", "text/html; charset=utf-8"
+        ext = os.path.splitext(fp)[1].lower()
+        ctype = MIME_EXTRA.get(ext) or mimetypes.guess_type(fp)[0] or "application/octet-stream"
+        status = "200 OK"
+    elif not os.path.isfile(os.path.join(DIST, "index.html")):
+        body = b"Lagoon Open build not found in ./dist/. Run 'npm install && npm run build' first."
+        status, ctype = "503 Service Unavailable", "text/plain; charset=utf-8"
     else:
         body, status, ctype = b"Not found", "404 Not Found", "text/plain"
+
+    cache = "public, max-age=86400" if ext in (".glb", ".gltf", ".woff2", ".woff", ".png", ".jpg", ".svg") else "no-store"
     head = (
         f"HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
-        "Cache-Control: no-store\r\nConnection: close\r\n\r\n"
+        f"Cache-Control: {cache}\r\nConnection: close\r\n\r\n"
     )
     sock.sendall(head.encode("ascii") + body)
 
@@ -229,7 +312,13 @@ def handle(sock, addr):
                 k, v = ln.split(":", 1)
                 hdrs[k.strip().lower()] = v.strip()
         if hdrs.get("upgrade", "").lower() == "websocket" and "sec-websocket-key" in hdrs:
-            accept = base64.b64encode(hashlib.sha1(hdrs["sec-websocket-key"].encode("ascii") + WS_GUID).digest()).decode("ascii")
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
+            except OSError:
+                pass
+            accept = base64.b64encode(
+                hashlib.sha1(hdrs["sec-websocket-key"].encode("ascii") + WS_GUID).digest()
+            ).decode("ascii")
             sock.sendall(
                 (
                     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -248,7 +337,7 @@ def handle(sock, addr):
         pass
     finally:
         if client is not None:
-            client.alive = False
+            client.close()
             with clients_lock:
                 if client in clients:
                     clients.remove(client)
@@ -260,7 +349,6 @@ def handle(sock, addr):
             pass
 
 
-# ---------------------------------------------------------------- main
 def main():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if os.name != "nt":
@@ -271,22 +359,20 @@ def main():
         print(f"\nCould not start the server on port {PORT}: {e}")
         print("Is another copy already running? Close it, or pass a different port number.")
         sys.exit(1)
-    srv.listen(8)
-    srv.settimeout(1.0)  # lets Ctrl+C stop the server on every OS
+    srv.listen(64)
+    srv.settimeout(1.0)
 
     ips = lan_ips()
     print()
     print(f"  LAGOON OPEN - LAN server running on port {PORT}")
     print("  ------------------------------------------------")
-    print("  On THIS computer: open the game, choose 'LAN Match', press 'Host Game'.")
+    print(f"  On THIS computer: open http://localhost:{PORT} , choose 'LAN Match', press 'Host Game'.")
     if ips:
-        print("  Your buddy chooses 'LAN Match' and joins with:  " + "   ".join(ips))
-        print(f"  (or they can just browse to http://{ips[0]}:{PORT} )")
+        print("  Your buddy opens:  " + "   ".join(f"http://{ip}:{PORT}" for ip in ips))
     else:
         print("  No LAN address found - are you connected to Wi-Fi / Ethernet?")
-    if not os.path.isfile(HTML):
-        print("  Note: lagoon-open-3d.html is not next to this script, so the page itself won't be served.")
-    print("  If your firewall asks whether to accept incoming connections, choose Allow.")
+    if not os.path.isfile(os.path.join(DIST, "index.html")):
+        print("  WARNING: ./dist/index.html not found! Run 'npm install && npm run build' first.")
     print("  Press Ctrl+C (or close this window) to stop the server.")
     print(flush=True)
 

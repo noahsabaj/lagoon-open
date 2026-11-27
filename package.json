@@ -1,0 +1,26 @@
+{
+  "name": "lagoon-open",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Motion-controlled 3D arcade tennis on tropical lagoon venues, powered by Three.js and Blender hero assets.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "lan": "python3 lagoon-server.py"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.1.1",
+    "@fontsource/lilita-one": "^5.1.1",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.170.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}
